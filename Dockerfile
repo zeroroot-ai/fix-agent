@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
 # static-debian13, not static-debian12. The binary is static and reads nothing
 # from the Debian userland, so the only Debian packages in the image are
 # ca-certificates, tzdata, base-files and netbase, and the base is chosen by
-# which of those is patched. DLA-4792-1 (fix-agent#31) fixes tzdata in
+# which of those is patched. DLA-4792-1 (cve-triage#31) fixes tzdata in
 # 2026c-0+deb12u1, and every static-debian12:nonroot build still ships
 # 2026b-0+deb12u1 (measured 2026-10-02 on the newest index, sha256:52dcfbab).
 # static-debian13:nonroot ships 2026c-0+deb13u1. Move the digest here when a
