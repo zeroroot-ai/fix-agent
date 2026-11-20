@@ -63,10 +63,7 @@ var ErrRetry = errors.New("the coding mission did not complete")
 // agent reads. The graph is the source of every value, so the code that
 // builds a prompt from it quotes it.
 type Finding struct {
-	ID string
-	// Status is the status that the daemon set. A pass sends only a Finding
-	// at StatusOpen to the coding path.
-	Status         string
+	ID             string
 	Vulnerability  string
 	Severity       string
 	PlaceLabel     string

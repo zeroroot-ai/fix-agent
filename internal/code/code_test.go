@@ -94,7 +94,7 @@ func (m *fakeHarness) ApplicationFindings(_ context.Context, app string, statuse
 
 var (
 	repo = fix.Repository{Name: "portal", ConnectorRef: "connector/gitlab-acme", Project: "acme/portal", BaseBranch: "main"}
-	fnd  = fix.Finding{ID: "f-1", Status: fix.StatusOpen, Vulnerability: "CVE-2026-1", Severity: "high",
+	fnd  = fix.Finding{ID: "f-1", Vulnerability: "CVE-2026-1", Severity: "high",
 		PlaceLabel: "Package", PlaceKey: "libx", Priority: "P1"}
 	fast = code.Config{Application: "portal", Bank: "b", Settle: 50 * time.Millisecond, Poll: time.Millisecond}
 )

@@ -56,7 +56,7 @@ func (e *fakeEmitter) Unfixed(_ context.Context, f fix.Finding, reason string) e
 var repo = fix.Repository{ConnectorRef: "connector/gitlab-acme", Project: "acme/portal"}
 
 func finding(id, prio string) fix.Finding {
-	return fix.Finding{ID: id, Status: fix.StatusOpen, Priority: prio, Vulnerability: "CVE-2026-0001", PlaceLabel: "Package", PlaceKey: "libx"}
+	return fix.Finding{ID: id, Priority: prio, Vulnerability: "CVE-2026-0001", PlaceLabel: "Package", PlaceKey: "libx"}
 }
 
 func TestRank_HighestPriorityFirstAndUnrankedLast(t *testing.T) {

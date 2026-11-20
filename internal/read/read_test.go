@@ -44,7 +44,7 @@ func TestOpenFindings_ReadsOnlyOpenAndMapsThePriority(t *testing.T) {
 		t.Fatalf("got %d findings, want 1", len(got))
 	}
 	f := got[0]
-	if f.ID != "f1" || f.Status != "open" || f.Priority != "P1" || f.Severity != "high" || f.PriorityReason != "live and exposed" || !f.Exposed {
+	if f.ID != "f1" || f.Priority != "P1" || f.Severity != "high" || f.PriorityReason != "live and exposed" || !f.Exposed {
 		t.Errorf("finding = %+v", f)
 	}
 }

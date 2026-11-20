@@ -77,7 +77,6 @@ func (r *Reader) OpenFindings(ctx context.Context, application string) ([]fix.Fi
 		}
 		out = append(out, fix.Finding{
 			ID:             id,
-			Status:         f.Status,
 			Vulnerability:  strings.TrimSpace(f.VulnerabilityID),
 			Severity:       strings.ToLower(strings.TrimSpace(f.Severity)),
 			PlaceLabel:     strings.TrimSpace(f.PlaceLabel),
