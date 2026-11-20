@@ -14,7 +14,7 @@ It is built with the ADK the way `cve-triage` is built. One dispatch is one pass
 |---|---|---|
 | `internal/fix` | The pass: rank, decide, code, write a reason. The seams of the parts below. | done, tested with fakes |
 | `internal/read` | The open findings of one Application, with the priority of `cve-triage`. | done, tested with fakes |
-| `internal/code` | Builds a mission of one job node with a merge request deliverable, runs it and reads the merge request. | done, tested with a fake mission client |
+| `internal/code` | Builds a mission of one job node with a merge request deliverable, runs it and reads the status that the daemon sets on the finding. | done, tested with a fake in the shapes of the daemon |
 | `internal/emit` | Writes the reason on a finding that the agent did not fix. | done, tested with fakes |
 | `internal/pass` | Assembles the modules and runs one pass against the harness. | done, tested with fakes |
 | `internal/dispatch` | The launch contract: grant, callback endpoint, task. | done, tested with a fake environment |
@@ -34,9 +34,10 @@ These items need a change in another repo.
 
 1. **Merge grant.** No agent can read `MergeGranted`. See gibson#1458.
 2. **Revert.** The daemon reverts a failed fix with its own client. See gibson#1465.
-3. **Mission output.** `internal/code` finds the merge request in the `deliverables` of the mission output. No test against a daemon has shown that shape yet.
-4. **The reason property.** The projector must store `fix_blocked_reason` on the `Finding` node, and `ApplicationFinding` must return it. Without the read, the next pass tries the same finding again.
-5. **A catalog mission.** The mission graph is built here. A checked-in catalog mission would be the one definition (ADR-0027).
+3. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It does not know the ref or the URL, because no harness call returns the mission output or the `FIXED_BY` edge. The daemon has both (the `merge_request` field of the World finding).
+4. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the next pass tries the same finding again.
+5. **A job in flight.** The daemon sets `fixing` only when the job closes. Two dispatches for one Application during a job can start two jobs for one finding. The daemon must mark the finding when it opens a fix job, or refuse a second open job for the same input.
+6. **A catalog mission.** The mission graph is built here. A checked-in catalog mission would be the one definition (ADR-0027).
 
 ## Develop
 

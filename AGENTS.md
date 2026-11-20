@@ -8,11 +8,11 @@ This file is the contract. If this file and the code disagree, the code wins.
 
 One dispatch is one pass over one Application. The agent does these steps in order.
 
-1. Read the open findings of the Application from the graph (`internal/read`).
+1. Read the open findings of the Application from the graph (`internal/read`). The agent keeps only a finding at the status `open`, even if the server returns more.
 2. Order them by the priority that `cve-triage` wrote: P1 first, then P2, P3 and P4. A finding with no priority comes last (`internal/fix`, `Rank`).
 3. Decide for each finding if the agent can fix it (`internal/fix`, `Decide`).
 4. Send the first fixable finding to the coding path and get one merge request (`internal/code`).
-5. Write a reason on each finding that it cannot fix, and go on to the next finding (`internal/emit`).
+5. Write a reason on each finding that it cannot fix, and go on to the next finding (`internal/emit`). A coding mission that did not complete gets no reason. The next pass tries that finding again.
 
 The pass starts at most three coding jobs (`fix.MaxAttempts`). One dispatch gives at most one merge request.
 
@@ -38,7 +38,15 @@ So `internal/code` builds a mission of one job node:
 - The spec input is the id of the finding. The daemon links the merge request to the finding when the job closes (`job_graph_link.go`), and it sets the status `fixing`.
 - The spec has no acceptance step. A job with no verifier accepts its first turn. The pipeline of the repository is the check.
 
-The agent creates the mission, runs it, waits, and reads the merge request from the `deliverables` of the mission output.
+The agent creates the mission, runs it and waits. Then it reads the status of the finding through `ApplicationFindings`. The status `fixing` (or a later status) is the proof that a merge request exists. The agent reads the status again for up to 30 seconds, because the graph projector writes the status a short time after the job closes.
+
+The agent does not read the mission output. The callback `WaitForMission` of the daemon returns the id, the status, the error and the time only. The output is never sent. Text in a node output can also come from the coding agent, so a merge request in it is a claim and not a fact.
+
+| Mission end | Meaning | What the agent does |
+|---|---|---|
+| Completed, finding at `fixing` or later | A merge request exists. | Reports it and ends the pass. |
+| Completed, finding still `open` | The job closed with no merge request. | Writes a reason and goes on. |
+| Failed or canceled | The cause can be temporary. | Writes no reason and goes on. The next pass tries again. |
 
 ## What the agent never does
 
@@ -68,27 +76,26 @@ The mission node that dispatches the agent sets these keys of the task context.
 |---|---|---|
 | `application` | yes | The Application to fix. The goal of the task is the fallback. |
 | `bank` | yes | The bank of coding agents, by id or name. |
-| `connector` | no | The connector of the Git host, in the form `connector/<name>`. |
-| `project` | no | The project path on the Git host. |
+| `connector` | yes | The connector of the Git host, in the form `connector/<name>`. |
+| `project` | yes | The project path on the Git host. |
 | `base_branch` | no | The branch that the merge request targets. |
 | `repository` | no | The name of the worktree. The default is `repo`. |
 | `finding` | no | One finding to fix. The default is the highest priority. |
 | `target` | no | The target of the coding mission. |
 | `timeout` | no | The wait for the coding job, as a Go duration. The default is 45 minutes. |
 
-With no `connector` and no `project`, the agent writes a reason on each finding and starts no job.
+A dispatch with no `bank`, no `connector` or no `project` fails the run. The agent writes no reason, because a fault of the dispatch is not a fact about a finding.
 
 ## Which findings the agent can fix
 
 `fix.Decide` is the one place of this rule. A finding that the coding path cannot start from gets a reason.
 
-- The Application has no repository.
 - The flaw is on a host or a service. A host fix goes through a connector of the class `patch`, and this agent has none.
 - The finding names no weakness and no place.
 
 The agent works for a scan finding, a finding from an attack proof and a finding from a tool of the buyer, because it reads only the fields that all three have. It does not judge how hard a change is. The coding agent and the pipeline judge that.
 
-The reason is the property `fix_blocked_reason` of the finding (`internal/emit`). It is written as a sighting with the identity property `brain_id`. The projector of the daemon must store this property. See the open items in the README.
+The reason is the property `fix_blocked_reason` of the finding (`internal/emit`). It is written as a sighting with the identity property `brain_id`. The projector of the daemon stores this property, and the daemon returns it in the component read. The harness callback does not return it yet, so the agent cannot skip a finding that has a reason. See the open items in the README.
 
 ## Dispatch, not enrollment
 

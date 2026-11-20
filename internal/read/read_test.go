@@ -26,7 +26,7 @@ func (f *fakeFindings) ApplicationFindings(_ context.Context, app string, status
 
 func TestOpenFindings_ReadsOnlyOpenAndMapsThePriority(t *testing.T) {
 	src := &fakeFindings{out: []agent.ApplicationFinding{{
-		FindingID: " f1 ", VulnerabilityID: "CVE-2026-1", Severity: "HIGH", PlaceLabel: "Package", PlaceKey: "libx",
+		FindingID: " f1 ", Status: "open", VulnerabilityID: "CVE-2026-1", Severity: "HIGH", PlaceLabel: "Package", PlaceKey: "libx",
 		Reachable: true, Exposed: true, Priority: "p1", PriorityReason: " live and exposed ",
 	}}}
 	r, err := read.New(src)
@@ -44,13 +44,13 @@ func TestOpenFindings_ReadsOnlyOpenAndMapsThePriority(t *testing.T) {
 		t.Fatalf("got %d findings, want 1", len(got))
 	}
 	f := got[0]
-	if f.ID != "f1" || f.Priority != "P1" || f.Severity != "high" || f.PriorityReason != "live and exposed" || !f.Exposed {
+	if f.ID != "f1" || f.Status != "open" || f.Priority != "P1" || f.Severity != "high" || f.PriorityReason != "live and exposed" || !f.Exposed {
 		t.Errorf("finding = %+v", f)
 	}
 }
 
 func TestOpenFindings_ExposedNeedsReachable(t *testing.T) {
-	src := &fakeFindings{out: []agent.ApplicationFinding{{FindingID: "f", Exposed: true}}}
+	src := &fakeFindings{out: []agent.ApplicationFinding{{FindingID: "f", Status: "open", Exposed: true}}}
 	r, _ := read.New(src)
 	got, _ := r.OpenFindings(context.Background(), "a")
 	if got[0].Exposed {
@@ -59,11 +59,29 @@ func TestOpenFindings_ExposedNeedsReachable(t *testing.T) {
 }
 
 func TestOpenFindings_DropsAFindingWithNoID(t *testing.T) {
-	src := &fakeFindings{out: []agent.ApplicationFinding{{FindingID: "  "}, {FindingID: "ok"}}}
+	src := &fakeFindings{out: []agent.ApplicationFinding{{FindingID: "  ", Status: "open"}, {FindingID: "ok", Status: "open"}}}
 	r, _ := read.New(src)
 	got, err := r.OpenFindings(context.Background(), "a")
 	if err != nil || len(got) != 1 || got[0].ID != "ok" {
 		t.Fatalf("got %+v err %v, want only ok", got, err)
+	}
+}
+
+func TestOpenFindings_KeepsOnlyOpenWhateverTheServerReturns(t *testing.T) {
+	// The statuses are the four that the daemon sets (gibson#1656). A server
+	// that ignored the filter must not make the agent open a second merge
+	// request for a Finding at fixing.
+	src := &fakeFindings{out: []agent.ApplicationFinding{
+		{FindingID: "a", Status: "fixing"},
+		{FindingID: "b", Status: "open"},
+		{FindingID: "c", Status: "fixed"},
+		{FindingID: "d", Status: "verified"},
+		{FindingID: "e", Status: ""},
+	}}
+	r, _ := read.New(src)
+	got, err := r.OpenFindings(context.Background(), "a")
+	if err != nil || len(got) != 1 || got[0].ID != "b" {
+		t.Fatalf("got %+v err %v, want only b", got, err)
 	}
 }
 

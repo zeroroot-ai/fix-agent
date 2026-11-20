@@ -21,12 +21,12 @@ var hostPlaces = map[string]bool{"host": true, "service": true}
 //
 // The rules are few on purpose. The agent does not judge how hard a change
 // is. The coding path and the pipeline of the repository judge that. A rule
-// here covers only a Finding that the coding path cannot start from.
-func Decide(f Finding, repo *Repository) Verdict {
+// here covers only a fact about the Finding that no retry changes.
+//
+// A missing repository is not a rule here. It is a fault of the dispatch, not
+// of the Finding, so the run fails and no Finding gets a reason.
+func Decide(f Finding) Verdict {
 	switch {
-	case repo == nil || strings.TrimSpace(repo.ConnectorRef) == "" || strings.TrimSpace(repo.Project) == "":
-		return Verdict{Reason: "the Application has no repository, so there is nothing to change: " +
-			"set the task context keys connector and project"}
 	case hostPlaces[strings.ToLower(strings.TrimSpace(f.PlaceLabel))]:
 		return Verdict{Reason: "the flaw is on a host, and a repository change does not reach it: " +
 			"a host fix needs a connector of the class patch"}

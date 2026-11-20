@@ -34,9 +34,9 @@ import (
 	"github.com/zeroroot-ai/sdk/mission"
 )
 
-// The task-context keys that the mission node sets. Only the application is
-// required to read. The other keys name the repository and the bank that the
-// coding job needs.
+// The task-context keys that the mission node sets. The application, the
+// bank, the connector and the project are required. A dispatch that lacks
+// one of them fails, and no Finding gets a reason.
 const (
 	// ContextKeyApplication names the Application to fix.
 	ContextKeyApplication = "application"
@@ -95,20 +95,24 @@ func ApplicationID(task agent.Task) (string, error) {
 	return "", fmt.Errorf("pass: no application: set task context %q or the goal", ContextKeyApplication)
 }
 
-// RepositoryOf reads the repository from the task context. It returns nil
-// when the dispatch names none, and fix.Decide then writes the reason on each
-// Finding.
-func RepositoryOf(task agent.Task) *fix.Repository {
+// RepositoryOf reads the repository from the task context.
+//
+// A dispatch with no connector or no project is a fault of the dispatch, as
+// a dispatch with no bank is. It fails the run. A reason on each Finding
+// would state a fact about the dispatch as a fact about the Finding, and the
+// next pass would skip Findings that it can fix.
+func RepositoryOf(task agent.Task) (fix.Repository, error) {
 	connector, project := ctxString(task, ContextKeyConnector), ctxString(task, ContextKeyProject)
-	if connector == "" && project == "" {
-		return nil
+	if connector == "" || project == "" {
+		return fix.Repository{}, fmt.Errorf("pass: no repository: set the task context keys %q and %q",
+			ContextKeyConnector, ContextKeyProject)
 	}
-	return &fix.Repository{
+	return fix.Repository{
 		Name:         ctxString(task, ContextKeyRepository),
 		ConnectorRef: connector,
 		Project:      project,
 		BaseBranch:   ctxString(task, ContextKeyBaseBranch),
-	}
+	}, nil
 }
 
 // Run performs one pass over one Application and reports what it did.
@@ -120,6 +124,10 @@ func Run(ctx context.Context, p Platform, task agent.Task) (agent.Result, error)
 	if err != nil {
 		return failed(), err
 	}
+	repo, err := RepositoryOf(task)
+	if err != nil {
+		return failed(), err
+	}
 	reader, err := read.New(p)
 	if err != nil {
 		return failed(), err
@@ -128,7 +136,11 @@ func Run(ctx context.Context, p Platform, task agent.Task) (agent.Result, error)
 	if err != nil {
 		return failed(), err
 	}
-	cfg := code.Config{Bank: ctxString(task, ContextKeyBank), Target: ctxString(task, ContextKeyTarget)}
+	cfg := code.Config{
+		Application: app,
+		Bank:        ctxString(task, ContextKeyBank),
+		Target:      ctxString(task, ContextKeyTarget),
+	}
 	if raw := ctxString(task, ContextKeyTimeout); raw != "" {
 		d, perr := time.ParseDuration(raw)
 		if perr != nil || d <= 0 {
@@ -141,18 +153,19 @@ func Run(ctx context.Context, p Platform, task agent.Task) (agent.Result, error)
 		return failed(), err
 	}
 
-	sum, err := fix.Pass(ctx, app, RepositoryOf(task), ctxString(task, ContextKeyFinding), reader, coder, emitter)
+	sum, err := fix.Pass(ctx, app, repo, ctxString(task, ContextKeyFinding), reader, coder, emitter)
 	if err != nil {
 		return failed(), err
 	}
+	// Result.Findings is for the Findings that a run discovered. This agent
+	// discovers none, so it stays empty. The Finding that got a merge request
+	// goes in the metadata.
 	res := agent.Result{Status: a2a.TaskStateCompleted, Output: Report(app, sum)}
 	if sum.Delivered != nil {
-		res.Findings = []string{sum.Delivered.ID}
 		res.Metadata = map[string]any{
-			"finding":           sum.Delivered.ID,
-			"merge_request":     sum.Delivery.MergeRequest,
-			"merge_request_url": sum.Delivery.URL,
-			"mission":           sum.Delivery.MissionID,
+			"finding":        sum.Delivered.ID,
+			"finding_status": sum.Delivery.Status,
+			"mission":        sum.Delivery.MissionID,
 		}
 	}
 	return res, nil
@@ -169,16 +182,17 @@ func Report(app string, s fix.Summary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "fix-agent: %s: %d open findings, %d coding jobs, %d without a fix\n", app, s.Total, s.Attempts, len(s.Skipped))
 	if s.Delivered != nil {
-		fmt.Fprintf(&b, "  merge request open for %s: %s", s.Delivered.ID, s.Delivery.MergeRequest)
-		if s.Delivery.URL != "" {
-			fmt.Fprintf(&b, " (%s)", s.Delivery.URL)
-		}
+		fmt.Fprintf(&b, "  merge request open for %s: the daemon set the status %s (mission %s)",
+			s.Delivered.ID, s.Delivery.Status, s.Delivery.MissionID)
 		b.WriteString("\n  waiting for the daemon to read the merge")
 	} else {
 		b.WriteString("  no merge request opened")
 	}
 	for _, sk := range s.Skipped {
 		fmt.Fprintf(&b, "\n  not fixed %s: %s", sk.Finding.ID, sk.Reason)
+	}
+	for _, sk := range s.Deferred {
+		fmt.Fprintf(&b, "\n  try again %s: %s", sk.Finding.ID, sk.Reason)
 	}
 	return b.String()
 }

@@ -29,17 +29,44 @@ import (
 // does not turn one dispatch into one job for each of them.
 const MaxAttempts = 3
 
-// ErrNoDelivery means that the coding job ended and gave no merge request.
-// The pass writes the reason on the Finding and goes on to the next Finding.
-// Any other error from a Coder is a failure of the call itself and stops the
-// pass.
-var ErrNoDelivery = errors.New("the coding job gave no merge request")
+// The statuses of a Finding (gibson#1656). The daemon sets each of them. The
+// agent only reads them.
+const (
+	// StatusOpen is the one status that a pass sends to the coding path.
+	StatusOpen = "open"
+	// StatusFixing means that a merge request for the Finding exists. The
+	// daemon sets it when a fix job closes with a merge request.
+	StatusFixing = "fixing"
+	// StatusFixed means that the merge request is merged.
+	StatusFixed = "fixed"
+	// StatusVerified means that the check that raised the Finding passed
+	// after the deploy.
+	StatusVerified = "verified"
+)
+
+// ErrNoDelivery means that the coding job completed and the daemon recorded
+// no merge request for the Finding. A retry of the same job gives the same
+// result, so the pass writes the reason on the Finding and goes on to the
+// next Finding.
+var ErrNoDelivery = errors.New("the coding job completed and the daemon recorded no merge request")
+
+// ErrRetry means that the coding mission did not complete. The cause can be
+// temporary, for example a timeout or a sandbox that stopped. The pass writes
+// no reason on the Finding, so the next pass tries it again, and goes on to
+// the next Finding.
+//
+// Any error from a Coder that wraps neither ErrNoDelivery nor ErrRetry is a
+// failure of the call itself and stops the pass.
+var ErrRetry = errors.New("the coding mission did not complete")
 
 // Finding is one open Finding of the Application with the facts that the
 // agent reads. The graph is the source of every value, so the code that
 // builds a prompt from it quotes it.
 type Finding struct {
-	ID             string
+	ID string
+	// Status is the status that the daemon set. A pass sends only a Finding
+	// at StatusOpen to the coding path.
+	Status         string
 	Vulnerability  string
 	Severity       string
 	PlaceLabel     string
@@ -64,11 +91,19 @@ type Repository struct {
 	BaseBranch string
 }
 
-// Delivery is the merge request that the coding job opened.
+// Delivery is the proof that the coding job opened a merge request: the
+// status that the daemon set on the Finding after the job closed.
+//
+// The agent does not read the merge request from the output of the mission.
+// No harness call returns that output, and text in it can come from the
+// coding agent. The status comes from the daemon, which set it from the
+// deliverable that the driver opened (gibson job_graph_link.go).
 type Delivery struct {
-	MergeRequest string
-	URL          string
-	MissionID    string
+	// Status is the status of the Finding after the job: StatusFixing, or a
+	// later status if the daemon moved it on.
+	Status string
+	// MissionID is the coding mission.
+	MissionID string
 }
 
 // Reader returns the open Findings of one Application.
@@ -105,15 +140,18 @@ type Summary struct {
 	Delivery Delivery
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
+	// Deferred lists the Findings whose coding mission did not complete. They
+	// got no reason, so the next pass tries them again.
+	Deferred []Skip
 	// Attempts is the number of coding jobs that the pass started.
 	Attempts int
 }
 
 // Pass runs one pass over one Application.
 //
-// repo is nil when the dispatch named no repository. only is empty to take
-// the highest priority first, or the id of the one Finding to fix.
-func Pass(ctx context.Context, app string, repo *Repository, only string,
+// only is empty to take the highest priority first, or the id of the one
+// Finding to fix.
+func Pass(ctx context.Context, app string, repo Repository, only string,
 	reader Reader, coder Coder, emitter Emitter,
 ) (Summary, error) {
 	findings, err := reader.OpenFindings(ctx, app)
@@ -136,24 +174,28 @@ func Pass(ctx context.Context, app string, repo *Repository, only string,
 		if sum.Attempts >= MaxAttempts {
 			break
 		}
-		if v := Decide(f, repo); !v.Fixable {
+		if v := Decide(f); !v.Fixable {
 			if err := skip(ctx, emitter, &sum, f, v.Reason); err != nil {
 				return sum, err
 			}
 			continue
 		}
 		sum.Attempts++
-		del, err := coder.Fix(ctx, f, *repo)
-		if errors.Is(err, ErrNoDelivery) {
+		del, err := coder.Fix(ctx, f, repo)
+		switch {
+		case errors.Is(err, ErrNoDelivery):
 			if err := skip(ctx, emitter, &sum, f, err.Error()); err != nil {
 				return sum, err
 			}
 			continue
-		}
-		if err != nil {
+		case errors.Is(err, ErrRetry):
+			slog.Warn("coding mission did not complete, no reason written", "finding", f.ID, "error", err)
+			sum.Deferred = append(sum.Deferred, Skip{Finding: f, Reason: err.Error()})
+			continue
+		case err != nil:
 			return sum, fmt.Errorf("fix: finding %s: %w", f.ID, err)
 		}
-		slog.Info("merge request opened", "finding", f.ID, "merge_request", del.MergeRequest)
+		slog.Info("merge request opened", "finding", f.ID, "status", del.Status, "mission", del.MissionID)
 		sum.Delivered, sum.Delivery = &f, del
 		break
 	}

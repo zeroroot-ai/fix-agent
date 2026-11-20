@@ -34,7 +34,7 @@ func (c *fakeCoder) Fix(_ context.Context, f fix.Finding, _ fix.Repository) (fix
 	if err := c.errs[f.ID]; err != nil {
 		return fix.Delivery{}, err
 	}
-	return fix.Delivery{MergeRequest: "mr-" + f.ID}, nil
+	return fix.Delivery{Status: fix.StatusFixing, MissionID: "mis-" + f.ID}, nil
 }
 
 type fakeEmitter struct {
@@ -53,10 +53,10 @@ func (e *fakeEmitter) Unfixed(_ context.Context, f fix.Finding, reason string) e
 	return nil
 }
 
-var repo = &fix.Repository{ConnectorRef: "connector/gitlab-acme", Project: "acme/portal"}
+var repo = fix.Repository{ConnectorRef: "connector/gitlab-acme", Project: "acme/portal"}
 
 func finding(id, prio string) fix.Finding {
-	return fix.Finding{ID: id, Priority: prio, Vulnerability: "CVE-2026-0001", PlaceLabel: "Package", PlaceKey: "libx"}
+	return fix.Finding{ID: id, Status: fix.StatusOpen, Priority: prio, Vulnerability: "CVE-2026-0001", PlaceLabel: "Package", PlaceKey: "libx"}
 }
 
 func TestRank_HighestPriorityFirstAndUnrankedLast(t *testing.T) {
@@ -87,8 +87,8 @@ func TestPass_FixesTheHighestPriorityFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if sum.Delivered == nil || sum.Delivered.ID != "top" || sum.Delivery.MergeRequest != "mr-top" {
-		t.Fatalf("delivered = %+v %+v, want top with mr-top", sum.Delivered, sum.Delivery)
+	if sum.Delivered == nil || sum.Delivered.ID != "top" || sum.Delivery.MissionID != "mis-top" {
+		t.Fatalf("delivered = %+v %+v, want top from mis-top", sum.Delivered, sum.Delivery)
 	}
 	if len(coder.asked) != 1 {
 		t.Fatalf("coding jobs = %v, want exactly one: one dispatch fixes one finding", coder.asked)
@@ -199,25 +199,31 @@ func TestPass_AFailedReadIsAnErrorAndNotAnEmptyPass(t *testing.T) {
 
 func TestPass_AFailedReasonWriteIsAnError(t *testing.T) {
 	boom := errors.New("observe failed")
-	_, err := fix.Pass(context.Background(), "app", nil, "",
-		fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeEmitter{err: boom})
+	host := finding("a", "P1")
+	host.PlaceLabel = "Host"
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{host}}, &fakeCoder{}, &fakeEmitter{err: boom})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the write error: a reason that went nowhere must not pass as success", err)
 	}
 }
 
-func TestPass_NoRepositoryWritesAReasonOnEachFinding(t *testing.T) {
-	coder, em := &fakeCoder{}, &fakeEmitter{}
-	sum, err := fix.Pass(context.Background(), "app", nil, "",
+func TestPass_AMissionThatDidNotCompleteWritesNoReason(t *testing.T) {
+	coder := &fakeCoder{errs: map[string]error{"a": fmt.Errorf("mission ended as failed: %w", fix.ErrRetry)}}
+	em := &fakeEmitter{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
 		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, coder, em)
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
-	if len(coder.asked) != 0 || sum.Delivered != nil {
-		t.Fatalf("coding jobs = %v, want none", coder.asked)
+	if r, ok := em.reasons["a"]; ok {
+		t.Errorf("a temporary fault wrote the permanent reason %q, so the next pass never tries a again", r)
 	}
-	if len(em.reasons) != 2 {
-		t.Errorf("reasons = %v, want one for each Finding", em.reasons)
+	if len(sum.Deferred) != 1 || sum.Deferred[0].Finding.ID != "a" || len(sum.Skipped) != 0 {
+		t.Errorf("deferred %+v skipped %+v, want a deferred and nothing skipped", sum.Deferred, sum.Skipped)
+	}
+	if sum.Delivered == nil || sum.Delivered.ID != "b" || sum.Attempts != 2 {
+		t.Fatalf("delivered %+v attempts %d, want b after 2 jobs", sum.Delivered, sum.Attempts)
 	}
 }
 
@@ -241,20 +247,17 @@ func TestDecide(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		f       fix.Finding
-		repo    *fix.Repository
 		fixable bool
 		reason  string
 	}{
-		{"package with repository", finding("a", "P1"), repo, true, ""},
-		{"no repository", finding("a", "P1"), nil, false, "no repository"},
-		{"repository without project", finding("a", "P1"), &fix.Repository{ConnectorRef: "connector/x"}, false, "no repository"},
-		{"host place", fix.Finding{ID: "a", Vulnerability: "CVE-1", PlaceLabel: "Host"}, repo, false, "patch"},
-		{"service place in other case", fix.Finding{ID: "a", Vulnerability: "CVE-1", PlaceLabel: " service "}, repo, false, "patch"},
-		{"no weakness and no place", fix.Finding{ID: "a"}, repo, false, "nothing to start from"},
-		{"place only", fix.Finding{ID: "a", PlaceKey: "repo/x"}, repo, true, ""},
+		{"package", finding("a", "P1"), true, ""},
+		{"host place", fix.Finding{ID: "a", Vulnerability: "CVE-1", PlaceLabel: "Host"}, false, "patch"},
+		{"service place in other case", fix.Finding{ID: "a", Vulnerability: "CVE-1", PlaceLabel: " service "}, false, "patch"},
+		{"no weakness and no place", fix.Finding{ID: "a"}, false, "nothing to start from"},
+		{"place only", fix.Finding{ID: "a", PlaceKey: "repo/x"}, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			v := fix.Decide(tc.f, tc.repo)
+			v := fix.Decide(tc.f)
 			if v.Fixable != tc.fixable {
 				t.Fatalf("Fixable = %v, want %v (%s)", v.Fixable, tc.fixable, v.Reason)
 			}

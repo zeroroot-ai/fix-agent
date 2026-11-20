@@ -22,10 +22,6 @@ import (
 	"github.com/zeroroot-ai/sdk/agent"
 )
 
-// StatusOpen is the one status that a fix pass reads. A Finding at "fixing"
-// has a merge request already. A Finding at "fixed" or "verified" is done.
-const StatusOpen = "open"
-
 // ServerDefaultLimit asks the server for its own default bound.
 const ServerDefaultLimit = 0
 
@@ -51,6 +47,11 @@ func New(src Findings) (*Reader, error) {
 
 // OpenFindings returns the open Findings of the Application.
 //
+// The read asks the server for the status open, and it also keeps only the
+// rows at that status. A Finding at fixing has a merge request already, so a
+// second coding job for it opens a second merge request. The check here does
+// not depend on the server filter.
+//
 // The server caps the read. An Application with a larger backlog gives the
 // first page. Each Finding in it is correct, and the pass fixes the highest
 // priority of the page.
@@ -59,7 +60,7 @@ func (r *Reader) OpenFindings(ctx context.Context, application string) ([]fix.Fi
 	if app == "" {
 		return nil, errors.New("read: no application")
 	}
-	raw, err := r.src.ApplicationFindings(ctx, app, []string{StatusOpen}, ServerDefaultLimit)
+	raw, err := r.src.ApplicationFindings(ctx, app, []string{fix.StatusOpen}, ServerDefaultLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read: application findings for %s: %w", app, err)
 	}
@@ -71,8 +72,12 @@ func (r *Reader) OpenFindings(ctx context.Context, application string) ([]fix.Fi
 			// and the coding job cannot name it as its input.
 			continue
 		}
+		if f.Status != fix.StatusOpen {
+			continue
+		}
 		out = append(out, fix.Finding{
 			ID:             id,
+			Status:         f.Status,
 			Vulnerability:  strings.TrimSpace(f.VulnerabilityID),
 			Severity:       strings.ToLower(strings.TrimSpace(f.Severity)),
 			PlaceLabel:     strings.TrimSpace(f.PlaceLabel),
