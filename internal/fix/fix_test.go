@@ -63,7 +63,7 @@ func TestRank_HighestPriorityFirstAndUnrankedLast(t *testing.T) {
 	got := fix.Rank([]fix.Finding{
 		finding("f5", ""), finding("f3", "P3"), finding("f2b", "p2"), finding("f1", "P1"), finding("f2a", "P2"), finding("f4", "P4"),
 	})
-	var ids []string
+	ids := make([]string, 0, len(got))
 	for _, f := range got {
 		ids = append(ids, f.ID)
 	}
@@ -160,7 +160,7 @@ func TestPass_ACodingJobWithNoMergeRequestGetsAReasonAndThePassGoesOn(t *testing
 func TestPass_TheNumberOfCodingJobsIsBounded(t *testing.T) {
 	fail := fmt.Errorf("no: %w", fix.ErrNoDelivery)
 	errs := map[string]error{}
-	var in []fix.Finding
+	in := make([]fix.Finding, 0, 10)
 	for i := range 10 {
 		id := fmt.Sprintf("f%02d", i)
 		in = append(in, finding(id, "P2"))
