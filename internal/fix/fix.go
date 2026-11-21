@@ -29,34 +29,24 @@ import (
 // does not turn one dispatch into one job for each of them.
 const MaxAttempts = 3
 
-// The statuses of a Finding (gibson#1656). The daemon sets each of them. The
-// agent only reads them.
+// The statuses of a Finding that the agent reads (gibson#1656). The daemon sets
+// them. It also sets fixed and verified, and the agent never reads those.
 const (
 	// StatusOpen is the one status that a pass sends to the coding path.
 	StatusOpen = "open"
 	// StatusFixing means that a merge request for the Finding exists. The
 	// daemon sets it when a fix job closes with a merge request.
 	StatusFixing = "fixing"
-	// StatusFixed means that the merge request is merged.
-	StatusFixed = "fixed"
-	// StatusVerified means that the check that raised the Finding passed
-	// after the deploy.
-	StatusVerified = "verified"
 )
 
-// ErrNoDelivery means that the coding job completed and the daemon recorded
-// no merge request for the Finding. A retry of the same job gives the same
-// result, so the pass writes the reason on the Finding and goes on to the
-// next Finding.
-var ErrNoDelivery = errors.New("the coding job completed and the daemon recorded no merge request")
-
-// ErrRetry means that the coding mission did not complete. The cause can be
-// temporary, for example a timeout or a sandbox that stopped. The pass writes
-// no reason on the Finding, so the next pass tries it again, and goes on to
-// the next Finding.
+// ErrRetry means that the coding path gave no merge request and the cause can
+// be temporary. Examples are a mission that did not complete and a daemon that
+// did not show the status fixing before the settle bound ended. The pass
+// writes no reason on the Finding, so the next pass tries it again, and goes
+// on to the next Finding.
 //
-// Any error from a Coder that wraps neither ErrNoDelivery nor ErrRetry is a
-// failure of the call itself and stops the pass.
+// Any error from a Coder that does not wrap ErrRetry is a failure of the call
+// itself and stops the pass.
 var ErrRetry = errors.New("the coding mission did not complete")
 
 // Finding is one open Finding of the Application with the facts that the
@@ -109,8 +99,7 @@ type Reader interface {
 }
 
 // Coder sends one Finding to the coding path and returns the merge request.
-// It returns an error that wraps ErrNoDelivery when the job ends with no
-// merge request.
+// It returns an error that wraps ErrRetry when the job gave no merge request.
 type Coder interface {
 	Fix(ctx context.Context, f Finding, repo Repository) (Delivery, error)
 }
@@ -180,12 +169,12 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		sum.Attempts++
 		del, err := coder.Fix(ctx, f, repo)
 		switch {
-		case errors.Is(err, ErrNoDelivery):
-			if err := skip(ctx, emitter, &sum, f, err.Error()); err != nil {
-				return sum, err
-			}
-			continue
 		case errors.Is(err, ErrRetry):
+			// A job that ended with no merge request cannot get a block reason
+			// yet. The daemon does not fill fix_blocked_reason and the SDK does
+			// not return it, so the next pass would read the same finding again.
+			// When gibson#1579 ships, skip the finding with a reason here.
+			// See https://github.com/zeroroot-ai/gibson/issues/1579
 			slog.Warn("coding mission did not complete, no reason written", "finding", f.ID, "error", err)
 			sum.Deferred = append(sum.Deferred, Skip{Finding: f, Reason: err.Error()})
 			continue

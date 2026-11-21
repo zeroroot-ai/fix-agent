@@ -2,7 +2,7 @@
 
 A Gibson agent that fixes one finding of an Application.
 
-It reads the open findings from the knowledge graph, takes the highest priority that `cve-triage` wrote, and sends it to a bank of coding agents. The coding job opens a merge request. A finding that the agent cannot fix gets a reason on the finding, and the agent goes on to the next one.
+It reads the open findings from the knowledge graph, takes the highest priority that `cve-triage` wrote, and sends it to a bank of coding agents. The coding job opens a merge request. A finding that the agent cannot fix by a rule gets a reason on the finding. A job that gives no merge request is deferred with no reason. In both cases the agent goes on to the next finding.
 
 The agent never states that a fix worked. The daemon reads the merge, the deploy and the health signal through the connector of the tenant, and the daemon decides the status of the finding. The agent contract is in [AGENTS.md](./AGENTS.md).
 
@@ -34,9 +34,9 @@ These items need a change in another repo.
 
 1. **Merge grant.** No agent can read `MergeGranted`. See gibson#1458.
 2. **Revert.** The daemon reverts a failed fix with its own client. See gibson#1465.
-3. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It does not know the ref or the URL, because no harness call returns the mission output or the `FIXED_BY` edge. The daemon has both (the `merge_request` field of the World finding).
-4. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the next pass tries the same finding again.
-5. **A job in flight.** The daemon sets `fixing` only when the job closes. Two dispatches for one Application during a job can start two jobs for one finding. The daemon must mark the finding when it opens a fix job, or refuse a second open job for the same input.
+3. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It reads only that status, because the daemon caps a read at 500 rows. It does not know the ref or the URL, because no harness call returns the mission output or the `FIXED_BY` edge. The daemon has both (the `merge_request` field of the World finding).
+4. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the agent cannot skip a finding with a block reason. A job that ends with no merge request, and a finding that the agent cannot fix, are deferred with no reason, and the next pass tries the same finding again. Gibson fills `fix_blocked_reason` under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). The SDK release that ships it comes after that.
+5. **A job in flight.** The daemon already holds one fix job for each finding (`FixClaimed`). A second dispatch for the same finding fails its mission. The agent reads that as a temporary fault and defers the finding. No change is needed in another repo.
 6. **A catalog mission.** The mission graph is built here. A checked-in catalog mission would be the one definition (ADR-0027).
 
 ## Develop

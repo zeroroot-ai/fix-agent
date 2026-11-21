@@ -125,17 +125,21 @@ func New(h Harness, cfg Config) (*Coder, error) {
 	return &Coder{h: h, cfg: cfg}, nil
 }
 
-// afterJob are the statuses that the daemon sets only when a merge request
-// for the Finding exists. A Finding moves on from fixing to fixed and to
-// verified, so a fast pipeline can show a later status.
-var afterJob = []string{fix.StatusFixing, fix.StatusFixed, fix.StatusVerified}
+// afterJob is the one status that the daemon sets when a merge request for
+// the Finding exists. The read is by status and the daemon returns at most 500
+// rows sorted by finding id. The set of fixing Findings is small, so the new
+// Finding stays on the page. A read of fixed and verified Findings is large and
+// it can push the new Finding off the page.
+var afterJob = []string{fix.StatusFixing}
 
 // Fix runs one coding job for one Finding and returns the proof that the
 // daemon recorded a merge request.
 //
 // A mission that did not complete returns an error that wraps fix.ErrRetry.
-// A mission that completed with no merge request returns an error that wraps
-// fix.ErrNoDelivery. A failed call to the daemon returns any other error.
+// A mission that completed while the daemon showed no merge request before
+// the Settle bound ended also wraps fix.ErrRetry. The agent cannot tell a job
+// with no merge request from a slow projector. A failed call to the daemon
+// returns any other error.
 func (c *Coder) Fix(ctx context.Context, f fix.Finding, repo fix.Repository) (fix.Delivery, error) {
 	def, err := Definition(c.cfg.Bank, f, repo)
 	if err != nil {
@@ -166,7 +170,8 @@ func (c *Coder) Fix(ctx context.Context, f fix.Finding, repo fix.Repository) (fi
 		return fix.Delivery{}, fmt.Errorf("code: mission %s: %w", info.ID, err)
 	}
 	if status == "" {
-		return fix.Delivery{}, fmt.Errorf("mission %s: %w", info.ID, fix.ErrNoDelivery)
+		return fix.Delivery{}, fmt.Errorf("mission %s: %w: the Finding was not fixing after %s",
+			info.ID, fix.ErrRetry, c.cfg.Settle)
 	}
 	return fix.Delivery{Status: status, MissionID: info.ID}, nil
 }
@@ -194,9 +199,8 @@ func (c *Coder) settle(ctx context.Context, id string) (string, error) {
 	}
 }
 
-// statusAfterJob reads the Finding among the Findings of the Application
-// that have a merge request. It returns "" when the Finding is not one of
-// them.
+// statusAfterJob reads the Finding among the fixing Findings of the
+// Application. It returns "" when the Finding is not one of them.
 func (c *Coder) statusAfterJob(ctx context.Context, id string) (string, error) {
 	rows, err := c.h.ApplicationFindings(ctx, c.cfg.Application, afterJob, 0)
 	if err != nil {

@@ -138,27 +138,8 @@ func TestPass_AFindingThatCannotBeFixedGetsAReasonAndThePassGoesOn(t *testing.T)
 	}
 }
 
-func TestPass_ACodingJobWithNoMergeRequestGetsAReasonAndThePassGoesOn(t *testing.T) {
-	coder := &fakeCoder{errs: map[string]error{"a": fmt.Errorf("job ended: %w", fix.ErrNoDelivery)}}
-	em := &fakeEmitter{}
-	sum, err := fix.Pass(context.Background(), "app", repo, "",
-		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, coder, em)
-	if err != nil {
-		t.Fatalf("Pass: %v", err)
-	}
-	if em.reasons["a"] == "" {
-		t.Error("no reason was written on the Finding whose job gave no merge request")
-	}
-	if sum.Delivered == nil || sum.Delivered.ID != "b" {
-		t.Fatalf("delivered = %+v, want b", sum.Delivered)
-	}
-	if sum.Attempts != 2 {
-		t.Errorf("Attempts = %d, want 2", sum.Attempts)
-	}
-}
-
 func TestPass_TheNumberOfCodingJobsIsBounded(t *testing.T) {
-	fail := fmt.Errorf("no: %w", fix.ErrNoDelivery)
+	fail := fmt.Errorf("no: %w", fix.ErrRetry)
 	errs := map[string]error{}
 	in := make([]fix.Finding, 0, 10)
 	for i := range 10 {

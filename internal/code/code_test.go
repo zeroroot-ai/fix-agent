@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -52,6 +53,7 @@ type fakeHarness struct {
 	timeout time.Duration
 	reads   int
 	app     string
+	asked   []string
 }
 
 func (m *fakeHarness) CreateMission(_ context.Context, def any, target string, opts *mission.CreateMissionOpts) (*mission.MissionInfo, error) {
@@ -72,8 +74,9 @@ func (m *fakeHarness) WaitForMission(_ context.Context, id string, timeout time.
 	return m.result, m.waitErr
 }
 
-func (m *fakeHarness) ApplicationFindings(_ context.Context, app string, statuses []string, _ int) ([]agent.ApplicationFinding, error) {
+func (m *fakeHarness) ApplicationFindings(_ context.Context, app string, statuses []string, limit int) ([]agent.ApplicationFinding, error) {
 	m.app = app
+	m.asked = statuses
 	m.reads++
 	if m.readErr != nil {
 		return nil, m.readErr
@@ -88,6 +91,15 @@ func (m *fakeHarness) ApplicationFindings(_ context.Context, app string, statuse
 		if len(statuses) == 0 || slices.Contains(statuses, s) {
 			out = append(out, agent.ApplicationFinding{FindingID: id, Status: s})
 		}
+	}
+	// The daemon sorts by finding id and returns at most 500 rows
+	// (gibson internal/platform/component/lifecycle_reads.go).
+	slices.SortFunc(out, func(a, b agent.ApplicationFinding) int { return strings.Compare(a.FindingID, b.FindingID) })
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -214,12 +226,21 @@ func TestFix_TheDaemonStatusIsTheProofOfAMergeRequest(t *testing.T) {
 	}
 }
 
-func TestFix_ALaterStatusIsAlsoAProof(t *testing.T) {
-	m := &fakeHarness{result: completed(), status: map[string]string{"f-1": fix.StatusFixed}}
+func TestFix_TheNewFindingIsNotLostBehindAFullPage(t *testing.T) {
+	// 600 Findings are fixed already and sort before f-1. A read of every
+	// status after the job fills the 500-row page with them and drops f-1.
+	status := map[string]string{}
+	for i := range 600 {
+		status[fmt.Sprintf("a%03d", i)] = "fixed"
+	}
+	m := &fakeHarness{result: completed(), deliver: true, status: status}
 	c, _ := code.New(m, fast)
 	d, err := c.Fix(context.Background(), fnd, repo)
-	if err != nil || d.Status != fix.StatusFixed {
-		t.Fatalf("delivery %+v err %v, want fixed: a fast pipeline moves the Finding on", d, err)
+	if err != nil || d.Status != fix.StatusFixing {
+		t.Fatalf("delivery %+v err %v, want fixing: the read must not depend on fixed Findings", d, err)
+	}
+	if !slices.Equal(m.asked, []string{fix.StatusFixing}) {
+		t.Errorf("statuses asked = %v, want only fixing", m.asked)
 	}
 }
 
@@ -234,17 +255,17 @@ func TestFix_TextInTheOutputIsNotAMergeRequest(t *testing.T) {
 	}
 	c, _ := code.New(&fakeHarness{result: res}, fast)
 	d, err := c.Fix(context.Background(), fnd, repo)
-	if !errors.Is(err, fix.ErrNoDelivery) {
-		t.Fatalf("delivery %+v err %v, want ErrNoDelivery: only the daemon status proves a merge request", d, err)
+	if !errors.Is(err, fix.ErrRetry) {
+		t.Fatalf("delivery %+v err %v, want ErrRetry: only the daemon status proves a merge request", d, err)
 	}
 }
 
-func TestFix_ACompletedJobWithNoMergeRequestIsNoDelivery(t *testing.T) {
+func TestFix_AStatusThatNeverShowsInTheSettleBoundIsARetry(t *testing.T) {
 	m := &fakeHarness{result: completed(), status: map[string]string{"other": fix.StatusFixing}}
 	c, _ := code.New(m, fast)
 	_, err := c.Fix(context.Background(), fnd, repo)
-	if !errors.Is(err, fix.ErrNoDelivery) || errors.Is(err, fix.ErrRetry) {
-		t.Fatalf("err = %v, want only ErrNoDelivery", err)
+	if !errors.Is(err, fix.ErrRetry) {
+		t.Fatalf("err = %v, want ErrRetry: a slow projector is temporary and must write no reason", err)
 	}
 	if m.reads < 2 {
 		t.Errorf("reads = %d, want the agent to wait for the projector before it decides", m.reads)
@@ -261,7 +282,7 @@ func TestFix_AMissionThatDidNotCompleteIsARetry(t *testing.T) {
 			m := &fakeHarness{result: res}
 			c, _ := code.New(m, fast)
 			_, err := c.Fix(context.Background(), fnd, repo)
-			if !errors.Is(err, fix.ErrRetry) || errors.Is(err, fix.ErrNoDelivery) {
+			if !errors.Is(err, fix.ErrRetry) {
 				t.Fatalf("err = %v, want only ErrRetry: a temporary fault must not block the Finding", err)
 			}
 			if m.reads != 0 {
@@ -271,7 +292,7 @@ func TestFix_AMissionThatDidNotCompleteIsARetry(t *testing.T) {
 	}
 }
 
-func TestFix_AFailedCallIsNotANoDelivery(t *testing.T) {
+func TestFix_AFailedCallIsNotARetry(t *testing.T) {
 	boom := errors.New("daemon down")
 	for name, m := range map[string]*fakeHarness{
 		"create": {createErr: boom},
@@ -285,8 +306,8 @@ func TestFix_AFailedCallIsNotANoDelivery(t *testing.T) {
 			if !errors.Is(err, boom) {
 				t.Fatalf("err = %v, want the call error", err)
 			}
-			if errors.Is(err, fix.ErrNoDelivery) || errors.Is(err, fix.ErrRetry) {
-				t.Fatal("a failed call must stop the pass, not write or defer a reason")
+			if errors.Is(err, fix.ErrRetry) {
+				t.Fatal("a failed call must stop the pass, not defer the Finding")
 			}
 		})
 	}
