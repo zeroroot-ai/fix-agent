@@ -47,7 +47,7 @@ const (
 //
 // Any error from a Coder that does not wrap ErrRetry is a failure of the call
 // itself and stops the pass.
-var ErrRetry = errors.New("the coding mission did not complete")
+var ErrRetry = errors.New("the coding job gave no merge request yet")
 
 // Finding is one open Finding of the Application with the facts that the
 // agent reads. The graph is the source of every value, so the code that
@@ -126,8 +126,9 @@ type Summary struct {
 	Delivery Delivery
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
-	// Deferred lists the Findings whose coding mission did not complete. They
-	// got no reason, so the next pass tries them again.
+	// Deferred lists the Findings whose coding job failed, was canceled, or
+	// gave no merge request within the settle time. They got no reason, so the
+	// next pass tries them again.
 	Deferred []Skip
 	// Attempts is the number of coding jobs that the pass started.
 	Attempts int
@@ -175,7 +176,7 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 			// not return it, so the next pass would read the same finding again.
 			// When gibson#1579 ships, skip the finding with a reason here.
 			// See https://github.com/zeroroot-ai/gibson/issues/1579
-			slog.Warn("coding mission did not complete, no reason written", "finding", f.ID, "error", err)
+			slog.Warn("coding job gave no merge request yet, no reason written", "finding", f.ID, "error", err)
 			sum.Deferred = append(sum.Deferred, Skip{Finding: f, Reason: err.Error()})
 			continue
 		case err != nil:

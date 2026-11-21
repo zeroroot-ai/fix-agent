@@ -38,14 +38,14 @@ So `internal/code` builds a mission of one job node:
 - The spec input is the id of the finding. The daemon links the merge request to the finding when the job closes (`job_graph_link.go`), and it sets the status `fixing`.
 - The spec has no acceptance step. A job with no verifier accepts its first turn. The pipeline of the repository is the check.
 
-The agent creates the mission, runs it and waits. Then it reads the status of the finding through `ApplicationFindings`. The status `fixing` (or a later status) is the proof that a merge request exists. The agent reads the status again for up to 30 seconds, because the graph projector writes the status a short time after the job closes.
+The agent creates the mission, runs it and waits. Then it reads the status of the finding through `ApplicationFindings`. The status `fixing` is the proof that a merge request exists. The agent reads only that status, because the daemon caps a read at 500 rows. The agent reads the status again for up to 30 seconds, because the graph projector writes the status a short time after the job closes.
 
 The agent does not read the mission output. The callback `WaitForMission` of the daemon returns the id, the status, the error and the time only. The output is never sent. Text in a node output can also come from the coding agent, so a merge request in it is a claim and not a fact.
 
 | Mission end | Meaning | What the agent does |
 |---|---|---|
-| Completed, finding at `fixing` or later | A merge request exists. | Reports it and ends the pass. |
-| Completed, finding still `open` | The job closed with no merge request. | Writes a reason and goes on. |
+| Completed, finding at `fixing` | A merge request exists. | Reports it and ends the pass. |
+| Completed, finding not at `fixing` after 30 seconds | No merge request, or the projector is slow. The agent cannot tell which. | Writes no reason and goes on. The next pass tries again. |
 | Failed or canceled | The cause can be temporary. | Writes no reason and goes on. The next pass tries again. |
 
 ## What the agent never does
