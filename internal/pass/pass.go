@@ -13,9 +13,10 @@
 //
 // # Where the pass stops
 //
-// The pass ends at the merge request. It does not merge, it does not wait for
-// the pipeline, and it does not revert. See AGENTS.md for the seams that the
-// daemon has to offer before the agent can merge.
+// The pass ends after the merge step. The agent calls the merge tool of the
+// connector, and the daemon allows the call only after it granted the merge
+// slot. The agent does not read the pipeline, the deploy or the health signal,
+// and it does not revert. See AGENTS.md.
 package pass
 
 import (
@@ -29,9 +30,11 @@ import (
 	"github.com/zeroroot-ai/fix-agent/internal/code"
 	"github.com/zeroroot-ai/fix-agent/internal/emit"
 	"github.com/zeroroot-ai/fix-agent/internal/fix"
+	"github.com/zeroroot-ai/fix-agent/internal/merge"
 	"github.com/zeroroot-ai/fix-agent/internal/read"
 	"github.com/zeroroot-ai/sdk/agent"
 	"github.com/zeroroot-ai/sdk/mission"
+	protolib "google.golang.org/protobuf/proto"
 )
 
 // The task-context keys that the mission node sets. The application, the
@@ -58,6 +61,9 @@ const (
 	ContextKeyRepository = "repository"
 	// ContextKeyTimeout bounds the wait for the coding job, as a Go duration.
 	ContextKeyTimeout = "timeout"
+	// ContextKeyMergeWait bounds the wait for the merge slot, as a Go
+	// duration.
+	ContextKeyMergeWait = "merge_wait"
 )
 
 // Platform is everything that this agent needs from the harness: the
@@ -72,6 +78,7 @@ type Platform interface {
 	RunMission(ctx context.Context, missionID string, opts *mission.RunMissionOpts) error
 	WaitForMission(ctx context.Context, missionID string, timeout time.Duration) (*mission.MissionResult, error)
 	Observe(ctx context.Context, obs agent.Observation) error
+	CallToolProto(ctx context.Context, name string, request, response protolib.Message, opts ...agent.ToolCallOption) error
 }
 
 // ctxString reads one string of the task context.
@@ -141,19 +148,23 @@ func Run(ctx context.Context, p Platform, task agent.Task) (agent.Result, error)
 		Bank:        ctxString(task, ContextKeyBank),
 		Target:      ctxString(task, ContextKeyTarget),
 	}
-	if raw := ctxString(task, ContextKeyTimeout); raw != "" {
-		d, perr := time.ParseDuration(raw)
-		if perr != nil || d <= 0 {
-			return failed(), fmt.Errorf("pass: task context %q is %q: want a positive duration such as 30m", ContextKeyTimeout, raw)
-		}
-		cfg.Timeout = d
+	if cfg.Timeout, err = duration(task, ContextKeyTimeout); err != nil {
+		return failed(), err
 	}
 	coder, err := code.New(p, cfg)
 	if err != nil {
 		return failed(), err
 	}
+	var mcfg merge.Config
+	if mcfg.Wait, err = duration(task, ContextKeyMergeWait); err != nil {
+		return failed(), err
+	}
+	merger, err := merge.New(p, mcfg)
+	if err != nil {
+		return failed(), err
+	}
 
-	sum, err := fix.Pass(ctx, app, repo, ctxString(task, ContextKeyFinding), reader, coder, emitter)
+	sum, err := fix.Pass(ctx, app, repo, ctxString(task, ContextKeyFinding), reader, coder, merger, emitter)
 	if err != nil {
 		return failed(), err
 	}
@@ -166,24 +177,40 @@ func Run(ctx context.Context, p Platform, task agent.Task) (agent.Result, error)
 			"finding":        sum.Delivered.ID,
 			"finding_status": sum.Delivery.Status,
 			"mission":        sum.Delivery.MissionID,
+			"merge":          string(sum.Merge.State),
 		}
 	}
 	return res, nil
+}
+
+// duration reads an optional positive duration of the task context. A missing
+// key gives zero, and the module then takes its default.
+func duration(task agent.Task, key string) (time.Duration, error) {
+	raw := ctxString(task, key)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("pass: task context %q is %q: want a positive duration such as 30m", key, raw)
+	}
+	return d, nil
 }
 
 func failed() agent.Result { return agent.Result{Status: a2a.TaskStateFailed} }
 
 // Report renders a pass summary as one readable block.
 //
-// It says that a merge request is open. It never says that a fix worked,
-// because the agent does not know that. The daemon reads the merge, the deploy
-// and the health signal, and it decides.
+// It says if the agent merged the merge request. It never says that a fix
+// worked, because the agent does not know that. The daemon reads the merge,
+// the deploy and the health signal, and it decides.
 func Report(app string, s fix.Summary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "fix-agent: %s: %d open findings, %d coding jobs, %d without a fix\n", app, s.Total, s.Attempts, len(s.Skipped))
 	if s.Delivered != nil {
-		fmt.Fprintf(&b, "  merge request open for %s: the daemon set the status %s (mission %s)",
+		fmt.Fprintf(&b, "  merge request opened for %s: the daemon set the status %s (mission %s)",
 			s.Delivered.ID, s.Delivery.Status, s.Delivery.MissionID)
+		fmt.Fprintf(&b, "\n  merge step: %s", mergeLine(s.Merge))
 		b.WriteString("\n  waiting for the daemon to read the merge")
 	} else {
 		b.WriteString("  no merge request opened")
@@ -195,4 +222,11 @@ func Report(app string, s fix.Summary) string {
 		fmt.Fprintf(&b, "\n  try again %s: %s", sk.Finding.ID, sk.Reason)
 	}
 	return b.String()
+}
+
+func mergeLine(m fix.Merge) string {
+	if m.Reason == "" {
+		return string(m.State)
+	}
+	return string(m.State) + ": " + m.Reason
 }

@@ -42,6 +42,8 @@ type fakeHarness struct {
 	status map[string]string
 	// deliver makes the wait set f-1 to fixing.
 	deliver bool
+	// mergeRequest is the key that the daemon returns for f-1 when it fills it.
+	mergeRequest string
 	// lag is the number of reads before the new status shows.
 	lag int
 
@@ -89,7 +91,11 @@ func (m *fakeHarness) ApplicationFindings(_ context.Context, app string, statuse
 	out := make([]agent.ApplicationFinding, 0, len(st))
 	for id, s := range st {
 		if len(statuses) == 0 || slices.Contains(statuses, s) {
-			out = append(out, agent.ApplicationFinding{FindingID: id, Status: s})
+			row := agent.ApplicationFinding{FindingID: id, Status: s}
+			if id == "f-1" && s == fix.StatusFixing {
+				row.MergeRequest = m.mergeRequest
+			}
+			out = append(out, row)
 		}
 	}
 	// The daemon sorts by finding id and returns at most 500 rows
@@ -223,6 +229,23 @@ func TestFix_TheDaemonStatusIsTheProofOfAMergeRequest(t *testing.T) {
 	}
 	if b, err := json.Marshal(m.def); err != nil || !strings.Contains(string(b), "NODE_TYPE_JOB") {
 		t.Errorf("the SDK would send %s (%v), want the protojson of the definition unchanged", b, err)
+	}
+}
+
+func TestFix_TheDeliveryCarriesTheKeyOfTheMergeRequest(t *testing.T) {
+	m := &fakeHarness{result: completed(), deliver: true, mergeRequest: " acme/portal!7 "}
+	c, err := code.New(m, fast)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d, err := c.Fix(context.Background(), fnd, repo)
+	if err != nil || d.MergeRequest != "acme/portal!7" {
+		t.Fatalf("delivery = %+v err %v, want the trimmed key that the daemon returned", d, err)
+	}
+	m = &fakeHarness{result: completed(), deliver: true}
+	c, _ = code.New(m, fast)
+	if d, err = c.Fix(context.Background(), fnd, repo); err != nil || d.MergeRequest != "" {
+		t.Fatalf("delivery = %+v err %v, want an empty key when the daemon returns none", d, err)
 	}
 }
 

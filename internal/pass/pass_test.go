@@ -18,6 +18,8 @@ import (
 	missionpb "github.com/zeroroot-ai/sdk/api/gen/gibson/mission/v1"
 	"github.com/zeroroot-ai/sdk/mission"
 	"google.golang.org/protobuf/encoding/protojson"
+	protolib "google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // fakePlatform is the harness callback client of a test. Nothing here touches
@@ -39,6 +41,33 @@ type fakePlatform struct {
 	runs    int
 
 	observed []agent.Observation
+
+	// merge is the answer of the daemon to invoke_tool. Nil means that the
+	// slot is granted and the host merges. calls are the requests.
+	merge func(call int, in *structpb.Struct) (*structpb.Struct, error)
+	calls []*structpb.Struct
+}
+
+// CallToolProto answers invoke_tool for the merge tool.
+func (f *fakePlatform) CallToolProto(_ context.Context, name string, req, resp protolib.Message, _ ...agent.ToolCallOption) error {
+	in, _ := req.(*structpb.Struct)
+	if name != "invoke_tool" || in == nil {
+		return errors.New("unexpected tool " + name)
+	}
+	f.calls = append(f.calls, in)
+	merge := f.merge
+	if merge == nil {
+		merge = mergedAnswer
+	}
+	out, err := merge(len(f.calls), in)
+	if err != nil {
+		return err
+	}
+	if out != nil {
+		protolib.Reset(resp)
+		protolib.Merge(resp, out)
+	}
+	return nil
 }
 
 func (f *fakePlatform) ApplicationFindings(_ context.Context, _ string, statuses []string, _ int) ([]agent.ApplicationFinding, error) {
@@ -106,9 +135,18 @@ func fullContext() map[string]any {
 
 func openFindings() []agent.ApplicationFinding {
 	return []agent.ApplicationFinding{
-		{FindingID: "low", Status: "open", VulnerabilityID: "CVE-2026-2", Priority: "P4", PlaceLabel: "Package"},
-		{FindingID: "top", Status: "open", VulnerabilityID: "CVE-2026-1", Priority: "P1", PlaceLabel: "Package"},
+		{FindingID: "low", Status: "open", VulnerabilityID: "CVE-2026-2", Priority: "P4", PlaceLabel: "Package",
+			MergeRequest: "acme/portal!8"},
+		{FindingID: "top", Status: "open", VulnerabilityID: "CVE-2026-1", Priority: "P1", PlaceLabel: "Package",
+			MergeRequest: "acme/portal!7"},
 	}
+}
+
+// mergedAnswer is the result of the merge tool of a connector.
+func mergedAnswer(_ int, _ *structpb.Struct) (*structpb.Struct, error) {
+	return structpb.NewStruct(map[string]any{"result": map[string]any{
+		"merge_request": "acme/portal!7", "state": "merged", "merged": true,
+	}})
 }
 
 func completed() *mission.MissionResult {
@@ -116,7 +154,7 @@ func completed() *mission.MissionResult {
 }
 
 func TestRun_FixesTheHighestPriorityAndReportsTheMergeRequest(t *testing.T) {
-	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
+	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true, merge: mergedAnswer}
 	res, err := pass.Run(context.Background(), p, task(fullContext()))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -134,18 +172,122 @@ func TestRun_FixesTheHighestPriorityAndReportsTheMergeRequest(t *testing.T) {
 	if len(res.Findings) != 0 {
 		t.Errorf("findings = %v, want none: Result.Findings is for discovered findings", res.Findings)
 	}
-	if res.Metadata["finding"] != "top" || res.Metadata["finding_status"] != "fixing" || res.Metadata["mission"] != "mis-1" {
+	if res.Metadata["finding"] != "top" || res.Metadata["finding_status"] != "fixing" || res.Metadata["mission"] != "mis-1" ||
+		res.Metadata["merge"] != "merged" {
 		t.Errorf("metadata = %v", res.Metadata)
 	}
 	out, _ := res.Output.(string)
 	if strings.Contains(strings.ToLower(out), "fixed") && !strings.Contains(out, "not fixed") {
 		t.Errorf("the report says a fix worked, and the agent does not know that:\n%s", out)
 	}
-	if !strings.Contains(out, "merge request open for top") {
+	if !strings.Contains(out, "merge request opened for top") || !strings.Contains(out, "merge step: merged") {
 		t.Errorf("report lacks the merge request:\n%s", out)
 	}
 	if len(p.observed) != 0 {
 		t.Errorf("wrote %d observations, want none: the daemon sets the status", len(p.observed))
+	}
+}
+
+// The tests below prove the merge step against the gate of the daemon. The
+// fake answers as gibson internal/engine/metatool does: the call reaches the
+// connector only when the caller holds the grant and the merge request holds
+// its slot. Each refusal text is the text that the daemon returns.
+
+func TestRun_MergesWithNoPersonWhenTheDaemonGrantedTheSlot(t *testing.T) {
+	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true, merge: mergedAnswer}
+	res, err := pass.Run(context.Background(), p, task(fullContext()))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Metadata["merge"] != "merged" || len(p.calls) != 1 {
+		t.Fatalf("merge %v after %d calls, want merged on the first call", res.Metadata["merge"], len(p.calls))
+	}
+	last := p.calls[0].AsMap()
+	args, _ := last["args"].(map[string]any)
+	if last["id"] != "mcp:gitlab-acme:merge_merge_request" || args["merge_request"] != "acme/portal!7" {
+		t.Errorf("request = %v, want the merge tool of the connector with the key of the merge request", last)
+	}
+	if len(p.observed) != 0 {
+		t.Errorf("wrote %d observations, want none: the daemon sets the status", len(p.observed))
+	}
+}
+
+func TestRun_AnAgentWithNoMergeGrantDoesNotMerge(t *testing.T) {
+	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
+	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
+		return nil, errors.New("CallToolProto error: metatool: not authorized to invoke tool: mcp:gitlab-acme:merge_merge_request")
+	}
+	res, err := pass.Run(context.Background(), p, task(fullContext()))
+	if err != nil {
+		t.Fatalf("Run: %v, want a clean pass: a missing grant is not a fault of the run", err)
+	}
+	if res.Status != a2a.TaskStateCompleted || res.Metadata["merge"] != "not_allowed" || len(p.calls) != 1 {
+		t.Fatalf("status %v merge %v calls %d, want completed, not_allowed and one call with no retry",
+			res.Status, res.Metadata["merge"], len(p.calls))
+	}
+	if out, _ := res.Output.(string); !strings.Contains(out, "holds no grant to merge") {
+		t.Errorf("report does not say why:\n%s", out)
+	}
+}
+
+func TestRun_ARefusalOfTheGitHostLeavesTheMergeRequestOpen(t *testing.T) {
+	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
+	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
+		return structpb.NewStruct(map[string]any{"result": map[string]any{
+			"state": "refused", "merged": false,
+			"reason": "GitHub does not allow the merge: a review is required",
+		}})
+	}
+	res, err := pass.Run(context.Background(), p, task(fullContext()))
+	if err != nil || res.Metadata["merge"] != "refused" || len(p.calls) != 1 {
+		t.Fatalf("res %v err %v calls %d, want refused after one call", res.Metadata, err, len(p.calls))
+	}
+	if out, _ := res.Output.(string); !strings.Contains(out, "a review is required") {
+		t.Errorf("report lacks the reason of the host:\n%s", out)
+	}
+}
+
+func TestRun_ASlotThatIsNeverGrantedEndsTheWaitWithTheMergeRequestOpen(t *testing.T) {
+	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
+	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
+		return nil, errors.New("CallToolProto error: metatool: merge not granted yet: the merge request waits for its merge slot")
+	}
+	c := fullContext()
+	c["merge_wait"] = "50ms"
+	res, err := pass.Run(context.Background(), p, task(c))
+	if err != nil || res.Metadata["merge"] != "waiting" {
+		t.Fatalf("res %v err %v, want waiting", res.Metadata, err)
+	}
+}
+
+func TestRun_NoMergeRequestKeyMeansNoMergeCall(t *testing.T) {
+	f := openFindings()
+	for i := range f {
+		f[i].MergeRequest = "" // a daemon that does not fill the key yet (gibson#1579)
+	}
+	p := &fakePlatform{findings: f, result: completed(), deliver: true, merge: mergedAnswer}
+	res, err := pass.Run(context.Background(), p, task(fullContext()))
+	if err != nil || res.Metadata["merge"] != "skipped" || len(p.calls) != 0 {
+		t.Fatalf("res %v err %v calls %d, want skipped with no call", res.Metadata, err, len(p.calls))
+	}
+}
+
+func TestRun_AMergeCallThatDoesNotReachTheDaemonFailsTheRun(t *testing.T) {
+	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
+	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
+		return nil, errors.New("CallToolProto callback failed: connection refused")
+	}
+	res, err := pass.Run(context.Background(), p, task(fullContext()))
+	if err == nil || res.Status != a2a.TaskStateFailed {
+		t.Fatalf("res %v err %v, want a failed run", res.Status, err)
+	}
+}
+
+func TestRun_ABadMergeWaitFailsTheRun(t *testing.T) {
+	c := fullContext()
+	c["merge_wait"] = "soon"
+	if _, err := pass.Run(context.Background(), &fakePlatform{}, task(c)); err == nil || !strings.Contains(err.Error(), "merge_wait") {
+		t.Fatalf("err = %v, want an error that names merge_wait", err)
 	}
 }
 

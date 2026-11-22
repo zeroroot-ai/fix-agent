@@ -37,6 +37,25 @@ func (c *fakeCoder) Fix(_ context.Context, f fix.Finding, _ fix.Repository) (fix
 	return fix.Delivery{Status: fix.StatusFixing, MissionID: "mis-" + f.ID}, nil
 }
 
+// fakeMerger records its calls and answers with state. An empty state means
+// that the merge is done.
+type fakeMerger struct {
+	state fix.MergeState
+	err   error
+	got   []fix.Delivery
+}
+
+func (m *fakeMerger) Merge(_ context.Context, _ fix.Repository, d fix.Delivery) (fix.Merge, error) {
+	m.got = append(m.got, d)
+	if m.err != nil {
+		return fix.Merge{}, m.err
+	}
+	if m.state == "" {
+		return fix.Merge{State: fix.MergeDone}, nil
+	}
+	return fix.Merge{State: m.state, Reason: "because"}, nil
+}
+
 type fakeEmitter struct {
 	reasons map[string]string
 	err     error
@@ -83,7 +102,7 @@ func TestRank_DoesNotChangeTheInput(t *testing.T) {
 func TestPass_FixesTheHighestPriorityFirst(t *testing.T) {
 	coder, em := &fakeCoder{}, &fakeEmitter{}
 	sum, err := fix.Pass(context.Background(), "app", repo, "",
-		fakeReader{findings: []fix.Finding{finding("low", "P4"), finding("top", "P1"), finding("mid", "P2")}}, coder, em)
+		fakeReader{findings: []fix.Finding{finding("low", "P4"), finding("top", "P1"), finding("mid", "P2")}}, coder, &fakeMerger{}, em)
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
@@ -101,7 +120,7 @@ func TestPass_FixesTheHighestPriorityFirst(t *testing.T) {
 func TestPass_ANamedFindingIsTheOnlyOneFixed(t *testing.T) {
 	coder := &fakeCoder{}
 	sum, err := fix.Pass(context.Background(), "app", repo, "mid",
-		fakeReader{findings: []fix.Finding{finding("top", "P1"), finding("mid", "P2")}}, coder, &fakeEmitter{})
+		fakeReader{findings: []fix.Finding{finding("top", "P1"), finding("mid", "P2")}}, coder, &fakeMerger{}, &fakeEmitter{})
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
@@ -112,7 +131,7 @@ func TestPass_ANamedFindingIsTheOnlyOneFixed(t *testing.T) {
 
 func TestPass_ANamedFindingThatIsNotOpenFails(t *testing.T) {
 	_, err := fix.Pass(context.Background(), "app", repo, "gone",
-		fakeReader{findings: []fix.Finding{finding("top", "P1")}}, &fakeCoder{}, &fakeEmitter{})
+		fakeReader{findings: []fix.Finding{finding("top", "P1")}}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
 	if err == nil || !strings.Contains(err.Error(), "gone") {
 		t.Fatalf("err = %v, want an error that names the finding", err)
 	}
@@ -123,7 +142,7 @@ func TestPass_AFindingThatCannotBeFixedGetsAReasonAndThePassGoesOn(t *testing.T)
 	host.PlaceLabel = "Host"
 	coder, em := &fakeCoder{}, &fakeEmitter{}
 	sum, err := fix.Pass(context.Background(), "app", repo, "",
-		fakeReader{findings: []fix.Finding{host, finding("pkg", "P2")}}, coder, em)
+		fakeReader{findings: []fix.Finding{host, finding("pkg", "P2")}}, coder, &fakeMerger{}, em)
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
@@ -148,7 +167,7 @@ func TestPass_TheNumberOfCodingJobsIsBounded(t *testing.T) {
 		errs[id] = fail
 	}
 	coder := &fakeCoder{errs: errs}
-	sum, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{findings: in}, coder, &fakeEmitter{})
+	sum, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{findings: in}, coder, &fakeMerger{}, &fakeEmitter{})
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
@@ -161,7 +180,7 @@ func TestPass_AFailedCallStopsThePass(t *testing.T) {
 	boom := errors.New("daemon down")
 	coder := &fakeCoder{errs: map[string]error{"a": boom}}
 	_, err := fix.Pass(context.Background(), "app", repo, "",
-		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, coder, &fakeEmitter{})
+		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, coder, &fakeMerger{}, &fakeEmitter{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the daemon error: a failed call is not a Finding that cannot be fixed", err)
 	}
@@ -172,7 +191,7 @@ func TestPass_AFailedCallStopsThePass(t *testing.T) {
 
 func TestPass_AFailedReadIsAnErrorAndNotAnEmptyPass(t *testing.T) {
 	boom := errors.New("graph unavailable")
-	_, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{err: boom}, &fakeCoder{}, &fakeEmitter{})
+	_, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{err: boom}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the read error", err)
 	}
@@ -183,7 +202,7 @@ func TestPass_AFailedReasonWriteIsAnError(t *testing.T) {
 	host := finding("a", "P1")
 	host.PlaceLabel = "Host"
 	_, err := fix.Pass(context.Background(), "app", repo, "",
-		fakeReader{findings: []fix.Finding{host}}, &fakeCoder{}, &fakeEmitter{err: boom})
+		fakeReader{findings: []fix.Finding{host}}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{err: boom})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the write error: a reason that went nowhere must not pass as success", err)
 	}
@@ -193,7 +212,7 @@ func TestPass_AMissionThatDidNotCompleteWritesNoReason(t *testing.T) {
 	coder := &fakeCoder{errs: map[string]error{"a": fmt.Errorf("mission ended as failed: %w", fix.ErrRetry)}}
 	em := &fakeEmitter{}
 	sum, err := fix.Pass(context.Background(), "app", repo, "",
-		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, coder, em)
+		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, coder, &fakeMerger{}, em)
 	if err != nil {
 		t.Fatalf("Pass: %v", err)
 	}
@@ -209,7 +228,7 @@ func TestPass_AMissionThatDidNotCompleteWritesNoReason(t *testing.T) {
 }
 
 func TestPass_NothingOpenIsACleanEmptyPass(t *testing.T) {
-	sum, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{}, &fakeCoder{}, &fakeEmitter{})
+	sum, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
 	if err != nil || sum.Total != 0 || sum.Delivered != nil {
 		t.Fatalf("sum = %+v err = %v, want an empty pass", sum, err)
 	}
@@ -218,7 +237,7 @@ func TestPass_NothingOpenIsACleanEmptyPass(t *testing.T) {
 func TestPass_ACanceledContextStopsThePass(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := fix.Pass(ctx, "app", repo, "", fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeEmitter{})
+	_, err := fix.Pass(ctx, "app", repo, "", fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -249,5 +268,49 @@ func TestDecide(t *testing.T) {
 				t.Errorf("a fixable finding has the reason %q", v.Reason)
 			}
 		})
+	}
+}
+
+func TestPass_TheMergeStepRunsOnceForTheDeliveredMergeRequest(t *testing.T) {
+	m := &fakeMerger{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("a", "P1"), finding("b", "P2")}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MissionID != "mis-a" {
+		t.Fatalf("merge calls = %+v, want one call for the merge request of a", m.got)
+	}
+	if sum.Merge.State != fix.MergeDone {
+		t.Errorf("Merge = %+v, want done", sum.Merge)
+	}
+}
+
+func TestPass_NoMergeStepWhenNoMergeRequestExists(t *testing.T) {
+	m := &fakeMerger{}
+	coder := &fakeCoder{errs: map[string]error{"a": fix.ErrRetry}}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("a", "P1")}}, coder, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 0 || sum.Merge.State != "" {
+		t.Fatalf("err %v merge calls %v merge %+v, want no merge call without a merge request", err, m.got, sum.Merge)
+	}
+}
+
+func TestPass_ARefusedMergeIsAnOutcomeAndNotAnError(t *testing.T) {
+	for _, st := range []fix.MergeState{fix.MergeWaiting, fix.MergeNotAllowed, fix.MergeRefused, fix.MergeSkipped} {
+		sum, err := fix.Pass(context.Background(), "app", repo, "",
+			fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeMerger{state: st}, &fakeEmitter{})
+		if err != nil || sum.Merge.State != st || sum.Delivered == nil {
+			t.Errorf("state %s: err %v merge %+v, want the outcome kept and the merge request still delivered", st, err, sum.Merge)
+		}
+	}
+}
+
+func TestPass_AFailedMergeCallFailsThePass(t *testing.T) {
+	boom := errors.New("daemon down")
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeMerger{err: boom}, &fakeEmitter{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the merge error", err)
 	}
 }

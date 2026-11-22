@@ -6,10 +6,11 @@
 // first one that it can fix to the coding path, and write a reason on each
 // Finding that it cannot fix.
 //
-// The pass never states that a fix worked. It ends when a merge request
-// exists. The daemon reads the merge, the deploy and the health signal
-// through the connector of the tenant, and the daemon decides what happens to
-// the Finding after that.
+// The pass never states that a fix worked. After the coding job it asks the
+// connector to merge the merge request, and the daemon allows that call only
+// when it granted the merge slot. The daemon reads the merge, the deploy and
+// the health signal through the connector of the tenant, and the daemon
+// decides what happens to the Finding after that.
 //
 // The seams below are the interfaces that the harness-backed packages
 // implement. A fake of each one is enough to test the pass.
@@ -91,6 +92,10 @@ type Delivery struct {
 	Status string
 	// MissionID is the coding mission.
 	MissionID string
+	// MergeRequest is the key of the merge request that the daemon linked to
+	// the Finding (the FIXED_BY edge). It is empty when the daemon did not
+	// return it. The key is the argument of the merge tool.
+	MergeRequest string
 }
 
 // Reader returns the open Findings of one Application.
@@ -102,6 +107,41 @@ type Reader interface {
 // It returns an error that wraps ErrRetry when the job gave no merge request.
 type Coder interface {
 	Fix(ctx context.Context, f Finding, repo Repository) (Delivery, error)
+}
+
+// MergeState is how the attempt to merge a merge request ended.
+type MergeState string
+
+// The states of Merge. None of them says that the fix worked. The daemon reads
+// the merge, the deploy and the health signal, and it decides the Finding.
+const (
+	// MergeDone means that the connector merged the merge request.
+	MergeDone MergeState = "merged"
+	// MergeWaiting means that the daemon granted no merge slot while the agent
+	// waited. The merge request stays open. The daemon keeps the queue.
+	MergeWaiting MergeState = "waiting"
+	// MergeNotAllowed means that the agent holds no merge grant. The merge
+	// request stays open for a person.
+	MergeNotAllowed MergeState = "not_allowed"
+	// MergeRefused means that the Git host refused the merge, for example the
+	// branch protection. The daemon reads the reason and records it.
+	MergeRefused MergeState = "refused"
+	// MergeSkipped means that the agent did not try, because it did not know
+	// the key of the merge request.
+	MergeSkipped MergeState = "skipped"
+)
+
+// Merge is the outcome of the merge step.
+type Merge struct {
+	State MergeState
+	// Reason is one plain sentence. It is empty for MergeDone.
+	Reason string
+}
+
+// Merger merges the merge request of a delivery after the daemon granted the
+// merge slot. It returns an error only when the call itself failed.
+type Merger interface {
+	Merge(ctx context.Context, repo Repository, d Delivery) (Merge, error)
 }
 
 // Emitter writes a reason on a Finding that the agent did not fix.
@@ -124,6 +164,9 @@ type Summary struct {
 	Delivered *Finding
 	// Delivery is the merge request of Delivered.
 	Delivery Delivery
+	// Merge is the outcome of the merge step for Delivered. It is the zero
+	// value when no merge request exists.
+	Merge Merge
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
 	// Deferred lists the Findings whose coding job failed, was canceled, or
@@ -139,7 +182,7 @@ type Summary struct {
 // only is empty to take the highest priority first, or the id of the one
 // Finding to fix.
 func Pass(ctx context.Context, app string, repo Repository, only string,
-	reader Reader, coder Coder, emitter Emitter,
+	reader Reader, coder Coder, merger Merger, emitter Emitter,
 ) (Summary, error) {
 	findings, err := reader.OpenFindings(ctx, app)
 	if err != nil {
@@ -184,6 +227,12 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		}
 		slog.Info("merge request opened", "finding", f.ID, "status", del.Status, "mission", del.MissionID)
 		sum.Delivered, sum.Delivery = &f, del
+		m, err := merger.Merge(ctx, repo, del)
+		if err != nil {
+			return sum, fmt.Errorf("fix: merge the merge request of finding %s: %w", f.ID, err)
+		}
+		slog.Info("merge step ended", "finding", f.ID, "state", m.State, "reason", m.Reason)
+		sum.Merge = m
 		break
 	}
 	return sum, nil
