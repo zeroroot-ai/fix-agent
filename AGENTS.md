@@ -64,7 +64,7 @@ The agent does not read the mission output. The callback `WaitForMission` of the
 - The role `merge` of the tool. The daemon runs the call only when `World.MayMerge` finds a slot that `MergeGranted` granted. The slot binds the fix mission, and the parent mission may merge with it. The agent runs in the parent mission.
 - The refusal "merge not granted yet" is the only signal of the slot that an agent gets. The agent calls again until `merge_wait` ends.
 
-Before the call, the agent reads `merge_request_state`. It sends `fix_head_sha` of the finding as `expected_head_sha`. It merges only when `changed_files` equals `fix_files` of the finding in path, change, previous path and blob sha, and it refuses a mode change, a mode other than 100644, a cut list and a list that the host did not give. The daemon fills `fix_head_sha` and `fix_files` from its own read of the merge request. The agent never takes them from the coding job. Until the daemon fills them, the agent makes no merge call.
+Before the call, the agent reads `merge_request_state`. It sends `fix_head_sha` of the finding as `expected_head_sha`. It merges only when `changed_files` equals `fix_files` of the finding in path, change, previous path and blob sha, and it refuses a mode change, a mode other than 100644, a cut list and a list that the host did not give. The daemon fills `fix_head_sha` and `fix_files` from its own read of the merge request. The agent never takes them from the coding job. When either is empty, the agent makes no merge call.
 
 `internal/merge` holds this step. It reads the refusals of the daemon by the code of `agent.ToolCallError` (`errors.As`), never by their text.
 
@@ -98,7 +98,7 @@ A dispatch with no `bank`, no `connector` or no `project` fails the run. The age
 
 The agent works for a scan finding, a finding from an attack proof and a finding from a tool of the buyer, because it reads only the fields that all three have. It does not judge how hard a change is. The coding agent and the pipeline judge that.
 
-The reason is the property `fix_blocked_reason` of the finding (`internal/emit`). It is written as a sighting with the identity property `brain_id`. The projector of the daemon stores this property, and the daemon returns it in the component read. The harness callback does not return it yet, so the agent cannot skip a finding that has a reason. See the open items in the README.
+The reason is the property `fix_blocked_reason` of the finding (`internal/emit`). It is written as a sighting with the identity property `brain_id`. The projector of the daemon stores this property, and the daemon returns it in the component read. The harness read returns it too (gibson#1603). The agent does not skip a finding by an old reason. It checks each finding again in each pass, because the facts of a finding can change and no actor clears a reason.
 
 ## Dispatch, not enrollment
 

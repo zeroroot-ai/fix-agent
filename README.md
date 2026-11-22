@@ -38,7 +38,7 @@ The daemon fills `fix_head_sha` and `fix_files` on the finding row from its own 
 
 Before the merge call, the agent also reads `merge_request_state`. It merges only when `changed_files` equals `fix_files` in path, change, previous path and blob sha. These cases are final refusals: a change of mode (`mode_changed`), a mode other than 100644, a list that the host cut (`changed_files_truncated`), a list that the host did not give (`changed_files_error`), and a head that differs from `fix_head_sha`. GitHub gives no mode, and an empty mode is not a refusal. A commit that a person pushes between the end of the job and the link is in both values, and the agent cannot see it.
 
-**Fail closed.** The daemon does not fill `fix_head_sha` yet (gibson wave 2). Until it does, the agent makes no merge call and no read, and the outcome is `skipped`. The merge request stays open for a person. The same applies when `fix_files` is empty.
+**Fail closed.** The daemon fills `fix_head_sha` and `fix_files` from its own read of the merge request (gibson#1619). When either is empty, the agent makes no merge call and no read, and the outcome is `skipped`. The merge request stays open for a person.
 
 The agent tells the refusals of the daemon apart by the code of `agent.ToolCallError`, never by its text. `UNAVAILABLE` means that the same call can succeed later (the slot is not granted, an approval is pending, a check of the daemon failed). `PERMISSION_DENIED` is final. Any other code is a refusal of the tool or the host. An error that is not a `ToolCallError` did not come from the daemon, and the run fails.
 
@@ -50,7 +50,7 @@ The agent tells the refusals of the daemon apart by the code of `agent.ToolCallE
 | Code `PERMISSION_DENIED` | `not_allowed` | Does not call again. The merge request stays open for a person. |
 | The head of the merge request differs from `fix_head_sha`, or the host refuses the head | `head_moved` | Does not call again. |
 | The files of the merge request are not `fix_files`, a mode change, a cut list or no list | `foreign_change` | Does not call again. |
-| The daemon filled no `fix_head_sha` or no `fix_files` | `skipped` | Makes no call. This is the case today. |
+| The daemon filled no `fix_head_sha` or no `fix_files` | `skipped` | Makes no call. |
 | The key of the merge request is empty | `skipped` | Makes no call. |
 | The connector gives no `head_sha` | `skipped` | Makes no merge call. |
 | The host refuses, for example the branch protection | `refused` | Does not call again. The finding stays `fixing`, and the daemon records the reason. |
@@ -71,11 +71,11 @@ Gibson sets seven variables when it launches the image. See [AGENTS.md](./AGENTS
 
 These items need a change in another repo.
 
-1. **Merge grant.** No harness call returns the merge slot. The agent asks by calling the merge tool, and the daemon refuses the call until it granted the slot. See [How the merge works](#how-the-merge-works). The agent names the merge request with the key that the harness read returns in `merge_request`. The daemon fills that key under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). Until then the merge step is skipped and the merge request stays open.
-2. **Head and files of the fix.** The daemon must fill `fix_head_sha` and `fix_files` on the finding row from its own read of the fix merge request (gibson wave 2). Until then the merge step reports `skipped`.
+1. **Merge grant.** No harness call returns the merge slot. The agent asks by calling the merge tool, and the daemon refuses the call until it granted the slot. See [How the merge works](#how-the-merge-works). The agent names the merge request with the key that the harness read returns in `merge_request`. The daemon fills that key (gibson#1603). A slot that the daemon grants after the agent run ended can stay held. See [gibson#1609](https://github.com/zeroroot-ai/gibson/issues/1609).
+2. **Head and files of the fix.** The daemon fills `fix_head_sha` and `fix_files` on the finding row from its own read of the fix merge request (gibson#1619). The file mode comes with [gibson#1628](https://github.com/zeroroot-ai/gibson/pull/1628).
 3. **Revert.** The daemon reverts a failed fix with its own client. See gibson#1465.
-4. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It reads that status, because the daemon caps a read at 500 rows. The SDK type `agent.ApplicationFinding` has the fields `MergeRequest` and `MergeRequestURL`. The agent reads the key from the row of the finding, and the daemon must fill it (see item 1). The agent does not read the mission output.
-5. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the agent cannot skip a finding with a block reason. A job that ends with no merge request is deferred with no reason, and the next pass tries the same finding again. A finding that the agent cannot fix by a rule still gets a reason (`Unfixed`). Gibson fills `fix_blocked_reason` under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). The SDK release that ships it comes after that.
+4. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It reads that status, because the daemon caps a read at 500 rows. The SDK type `agent.ApplicationFinding` has the fields `MergeRequest` and `MergeRequestURL`. The agent reads the key from the row of the finding. The agent does not read the mission output.
+5. **The reason property.** The agent writes `fix_blocked_reason` when a rule says that it cannot fix a finding (`Unfixed`). The harness read returns the reason (gibson#1603). The agent does not skip a finding by an old reason. It checks each finding again in each pass, because the facts of a finding can change and no actor clears a reason. A job that ends with no merge request gets no reason, and the next pass tries the finding again.
 6. **A job in flight.** The daemon already holds one fix job for each finding (`FixClaimed`). A second dispatch for the same finding fails its mission. The agent reads that as a temporary fault and defers the finding. No change is needed in another repo.
 7. **A catalog mission.** The mission graph is built here. A checked-in catalog mission would be the one definition (ADR-0027).
 
