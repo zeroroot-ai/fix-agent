@@ -190,14 +190,14 @@ func TestRun_FixesTheHighestPriorityAndReportsTheMergeRequest(t *testing.T) {
 		t.Errorf("findings = %v, want none: Result.Findings is for discovered findings", res.Findings)
 	}
 	if res.Metadata["finding"] != "top" || res.Metadata["finding_status"] != "fixing" || res.Metadata["mission"] != "mis-1" ||
-		res.Metadata["merge"] != "merged" {
+		res.Metadata["merge"] != "skipped" {
 		t.Errorf("metadata = %v", res.Metadata)
 	}
 	out, _ := res.Output.(string)
 	if strings.Contains(strings.ToLower(out), "fixed") && !strings.Contains(out, "not fixed") {
 		t.Errorf("the report says a fix worked, and the agent does not know that:\n%s", out)
 	}
-	if !strings.Contains(out, "merge request opened for top") || !strings.Contains(out, "merge step: merged") {
+	if !strings.Contains(out, "merge request opened for top") || !strings.Contains(out, "merge step: skipped") {
 		t.Errorf("report lacks the merge request:\n%s", out)
 	}
 	if len(p.observed) != 0 {
@@ -210,93 +210,20 @@ func TestRun_FixesTheHighestPriorityAndReportsTheMergeRequest(t *testing.T) {
 // connector only when the caller holds the grant and the merge request holds
 // its slot. Each refusal text is the text that the daemon returns.
 
-func TestRun_MergesWithNoPersonWhenTheDaemonGrantedTheSlot(t *testing.T) {
+// No harness call returns the paths that the coding job changed yet, so the
+// merge step cannot compare them with the branch. It makes no call and the
+// merge request stays open. The merge flows are tested in package merge.
+func TestRun_NoRecordOfTheJobPathsMeansNoMergeCall(t *testing.T) {
 	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true, merge: mergedAnswer}
-	res, err := pass.Run(context.Background(), p, task(fullContext()))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if res.Metadata["merge"] != "merged" || len(p.calls) != 1 {
-		t.Fatalf("merge %v after %d calls, want merged on the first call", res.Metadata["merge"], len(p.calls))
-	}
-	last := p.calls[0].AsMap()
-	args, _ := last["args"].(map[string]any)
-	if last["id"] != "mcp:gitlab-acme:merge_merge_request" || args["merge_request"] != "acme/portal!7" {
-		t.Errorf("request = %v, want the merge tool of the connector with the key of the merge request", last)
-	}
-	if len(p.observed) != 0 {
-		t.Errorf("wrote %d observations, want none: the daemon sets the status", len(p.observed))
-	}
-}
-
-func TestRun_AnAgentWithNoMergeGrantDoesNotMerge(t *testing.T) {
-	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
-	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
-		return nil, errors.New("CallToolProto error: metatool: not authorized to invoke tool: mcp:gitlab-acme:merge_merge_request")
-	}
-	res, err := pass.Run(context.Background(), p, task(fullContext()))
-	if err != nil {
-		t.Fatalf("Run: %v, want a clean pass: a missing grant is not a fault of the run", err)
-	}
-	if res.Status != a2a.TaskStateCompleted || res.Metadata["merge"] != "not_allowed" || len(p.calls) != 1 {
-		t.Fatalf("status %v merge %v calls %d, want completed, not_allowed and one call with no retry",
-			res.Status, res.Metadata["merge"], len(p.calls))
-	}
-	if out, _ := res.Output.(string); !strings.Contains(out, "holds no grant to merge") {
-		t.Errorf("report does not say why:\n%s", out)
-	}
-}
-
-func TestRun_ARefusalOfTheGitHostLeavesTheMergeRequestOpen(t *testing.T) {
-	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
-	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
-		return answer(map[string]any{
-			"state": "refused", "merged": false,
-			"reason": "GitHub does not allow the merge: a review is required",
-		})
-	}
-	res, err := pass.Run(context.Background(), p, task(fullContext()))
-	if err != nil || res.Metadata["merge"] != "refused" || len(p.calls) != 1 {
-		t.Fatalf("res %v err %v calls %d, want refused after one call", res.Metadata, err, len(p.calls))
-	}
-	if out, _ := res.Output.(string); !strings.Contains(out, "a review is required") {
-		t.Errorf("report lacks the reason of the host:\n%s", out)
-	}
-}
-
-func TestRun_ASlotThatIsNeverGrantedEndsTheWaitWithTheMergeRequestOpen(t *testing.T) {
-	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
-	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
-		return nil, errors.New("CallToolProto error: metatool: merge not granted yet: the merge request waits for its merge slot")
-	}
-	c := fullContext()
-	c["merge_wait"] = "50ms"
-	res, err := pass.Run(context.Background(), p, task(c))
-	if err != nil || res.Metadata["merge"] != "waiting" {
-		t.Fatalf("res %v err %v, want waiting", res.Metadata, err)
-	}
-}
-
-func TestRun_NoMergeRequestKeyMeansNoMergeCall(t *testing.T) {
-	f := openFindings()
-	for i := range f {
-		f[i].MergeRequest = "" // a daemon that does not fill the key yet (gibson#1579)
-	}
-	p := &fakePlatform{findings: f, result: completed(), deliver: true, merge: mergedAnswer}
 	res, err := pass.Run(context.Background(), p, task(fullContext()))
 	if err != nil || res.Metadata["merge"] != "skipped" || len(p.calls) != 0 {
 		t.Fatalf("res %v err %v calls %d, want skipped with no call", res.Metadata, err, len(p.calls))
 	}
-}
-
-func TestRun_AMergeCallThatDoesNotReachTheDaemonFailsTheRun(t *testing.T) {
-	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
-	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
-		return nil, errors.New("CallToolProto callback failed: connection refused")
+	if out, _ := res.Output.(string); !strings.Contains(out, "no record of the paths") {
+		t.Errorf("report does not say why:\n%s", out)
 	}
-	res, err := pass.Run(context.Background(), p, task(fullContext()))
-	if err == nil || res.Status != a2a.TaskStateFailed {
-		t.Fatalf("res %v err %v, want a failed run", res.Status, err)
+	if len(p.observed) != 0 {
+		t.Errorf("wrote %d observations, want none", len(p.observed))
 	}
 }
 

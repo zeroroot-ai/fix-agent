@@ -96,6 +96,10 @@ type Delivery struct {
 	// the Finding (the FIXED_BY edge). It is empty when the daemon did not
 	// return it. The key is the argument of the merge tool.
 	MergeRequest string
+	// ChangedFiles is the set of paths that the coding job changed, as the job
+	// recorded it. It is empty when no harness call returned it. The merge step
+	// does not merge without it.
+	ChangedFiles []string
 }
 
 // Reader returns the open Findings of one Application.
@@ -130,6 +134,10 @@ const (
 	// agent read it, for example a person pushed a commit. The host refused the
 	// merge and the refusal is final.
 	MergeHeadMoved MergeState = "head_moved"
+	// MergeForeignChange means that the paths of the merge request are not the
+	// paths that the coding job changed, for example a person committed to the
+	// branch before the job pushed. The refusal is final.
+	MergeForeignChange MergeState = "foreign_change"
 	// MergeSkipped means that the agent did not try, because it did not know
 	// the key of the merge request.
 	MergeSkipped MergeState = "skipped"

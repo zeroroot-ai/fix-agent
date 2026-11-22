@@ -36,6 +36,16 @@
 // tool argument expected_head_sha is in zeroroot-ai/connectors
 // feat/fixloop-open-merge-request. The tool in main has the argument sha.
 //
+// # Paths that the job did not change
+//
+// The pin of the head does not stop a commit that was on the branch before the
+// coding job pushed. So the agent also compares changed_files of
+// merge_request_state with the set of paths that the coding job changed
+// (Delivery.ChangedFiles), and it does not merge unless the two sets are equal.
+// A mismatch is final. The agent does not guess the set. If the delivery has no
+// record of it, or the connector returns no changed_files, the agent does not
+// merge. No harness call returns the paths of the job yet, see AGENTS.md.
+//
 // # What it leaves to the daemon
 //
 // A refusal of the Git host, for example the branch protection, ends the step
@@ -49,6 +59,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -162,11 +173,18 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 			Reason: "the daemon returned no key for the merge request, so the agent cannot name it to the merge tool",
 		}, nil
 	}
+	if len(d.ChangedFiles) == 0 {
+		return fix.Merge{
+			State: fix.MergeSkipped,
+			Reason: "the agent has no record of the paths that the coding job changed, " +
+				"so it cannot tell a foreign commit on the branch from the change of the job",
+		}, nil
+	}
 	id, err := ToolID(repo.ConnectorRef)
 	if err != nil {
 		return fix.Merge{}, err
 	}
-	head, early, err := m.head(ctx, repo, d.MergeRequest)
+	head, early, err := m.head(ctx, repo, d)
 	if err != nil || early != nil {
 		return derefMerge(early), err
 	}
@@ -211,7 +229,8 @@ func derefMerge(m *fix.Merge) fix.Merge {
 // head reads head_sha of the merge request. It returns an outcome and no head
 // when the agent must not ask for the merge: the connector gave no head_sha, or
 // the read was refused.
-func (m *Merger) head(ctx context.Context, repo fix.Repository, key string) (string, *fix.Merge, error) {
+func (m *Merger) head(ctx context.Context, repo fix.Repository, d fix.Delivery) (string, *fix.Merge, error) {
+	key := d.MergeRequest
 	id, err := toolID(repo.ConnectorRef, ToolState)
 	if err != nil {
 		return "", nil, err
@@ -241,7 +260,55 @@ func (m *Merger) head(ctx context.Context, repo fix.Repository, key string) (str
 			Reason: "the connector returned no head_sha, so the agent cannot bind the merge to the head that it saw",
 		}, nil
 	}
+	if len(r.ChangedFiles) == 0 {
+		return "", &fix.Merge{
+			State:  fix.MergeSkipped,
+			Reason: "the connector returned no changed_files, so the agent cannot check the paths of the branch",
+		}, nil
+	}
+	if extra, missing := diff(r.ChangedFiles, d.ChangedFiles); len(extra)+len(missing) > 0 {
+		return "", &fix.Merge{
+			State: fix.MergeForeignChange,
+			Reason: "the paths of the merge request are not the paths that the coding job changed" +
+				listed(" (not from the job: ", extra) + listed(" (missing: ", missing),
+		}, nil
+	}
 	return r.HeadSHA, nil, nil
+}
+
+// diff returns the paths of got that are not in want, and the paths of want
+// that are not in got. Both are sorted.
+func diff(got, want []string) (extra, missing []string) {
+	g, w := map[string]bool{}, map[string]bool{}
+	for _, p := range got {
+		g[p] = true
+	}
+	for _, p := range want {
+		w[p] = true
+	}
+	for p := range g {
+		if !w[p] {
+			extra = append(extra, p)
+		}
+	}
+	for p := range w {
+		if !g[p] {
+			missing = append(missing, p)
+		}
+	}
+	slices.Sort(extra)
+	slices.Sort(missing)
+	return extra, missing
+}
+
+func listed(label string, paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	if len(paths) > 5 {
+		paths = append(paths[:5:5], "...")
+	}
+	return label + strings.Join(paths, ", ") + ")"
 }
 
 func request(id, mergeRequest, head string) (*structpb.Struct, error) {
@@ -261,6 +328,10 @@ type toolResult struct {
 	State   string `json:"state"`
 	Reason  string `json:"reason"`
 	HeadSHA string `json:"head_sha"`
+	// ChangedFiles is the set of paths that the merge request changes. The tool
+	// merge_request_state returns it in the connectors change that adds
+	// changed_files.
+	ChangedFiles []string `json:"changed_files"`
 }
 
 // result reads the result object of an invoke_tool answer. An answer with no

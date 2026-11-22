@@ -35,6 +35,10 @@ type gate struct {
 	// noHead false means "h1".
 	head   string
 	noHead bool
+	// files is changed_files of the state. Nil means the two paths of the job.
+	// noFiles leaves the key out.
+	files   []any
+	noFiles bool
 	// transient is the refusal text for the first transientN merge calls.
 	transient  string
 	transientN int
@@ -59,6 +63,13 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 		res := map[string]any{"state": "open"}
 		if !g.noHead {
 			res["head_sha"] = head
+		}
+		if !g.noFiles {
+			files := g.files
+			if files == nil {
+				files = []any{"a.go", "b_test.go"}
+			}
+			res["changed_files"] = files
 		}
 		out, err := structpb.NewStruct(map[string]any{"result": res})
 		if err != nil {
@@ -96,8 +107,11 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 
 var (
 	repo     = fix.Repository{ConnectorRef: "connector/github-acme", Project: "acme/portal"}
-	delivery = fix.Delivery{Status: fix.StatusFixing, MissionID: "mis-1", MergeRequest: "acme/portal#7"}
-	fast     = merge.Config{Wait: time.Minute, Poll: time.Millisecond}
+	delivery = fix.Delivery{
+		Status: fix.StatusFixing, MissionID: "mis-1", MergeRequest: "acme/portal#7",
+		ChangedFiles: []string{"b_test.go", "a.go"},
+	}
+	fast = merge.Config{Wait: time.Minute, Poll: time.Millisecond}
 )
 
 func run(t *testing.T, g *gate, cfg merge.Config, d fix.Delivery) (fix.Merge, error) {
@@ -346,5 +360,45 @@ func TestMerge_AnAnswerWithNoResultObjectIsAnErrorAndIsNotResent(t *testing.T) {
 	_, err := run(t, g, fast, delivery)
 	if err == nil || !strings.Contains(err.Error(), "no result object") || g.calls != 1 {
 		t.Fatalf("err %v after %d calls, want an error after one call", err, g.calls)
+	}
+}
+
+// A person committed to the fix branch before the coding job pushed. The head
+// pin passes, because the agent reads the head after that commit. The set of
+// paths does not equal the set of the job, so the agent does not merge.
+func TestMerge_ABranchWithAForeignCommitIsAFinalRefusal(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, files: []any{"a.go", "b_test.go", "deploy/secrets.yaml"}}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change and no merge call", got, err, g.calls)
+	}
+	if !strings.Contains(got.Reason, "deploy/secrets.yaml") {
+		t.Errorf("reason %q does not name the foreign path", got.Reason)
+	}
+}
+
+func TestMerge_AMissingPathOfTheJobIsAFinalRefusal(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, files: []any{"a.go"}}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "b_test.go") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change naming b_test.go", got, err, g.calls)
+	}
+}
+
+func TestMerge_NoRecordOfTheJobPathsMeansNoCall(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1}
+	d := delivery
+	d.ChangedFiles = nil
+	got, err := run(t, g, fast, d)
+	if err != nil || got.State != fix.MergeSkipped || g.calls != 0 || g.reads != 0 {
+		t.Fatalf("got %+v err %v calls %d reads %d, want skipped with no call", got, err, g.calls, g.reads)
+	}
+}
+
+func TestMerge_NoChangedFilesFromTheConnectorMeansNoMergeCall(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, noFiles: true}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeSkipped || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d merge calls, want skipped", got, err, g.calls)
 	}
 }

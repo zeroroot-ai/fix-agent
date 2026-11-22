@@ -36,13 +36,17 @@ The agent calls `invoke_tool` with the id `mcp:<connector>:merge_merge_request` 
 
 Before the first merge call, the agent reads `head_sha` of the merge request with `merge_request_state`. It sends the value as `expected_head_sha`. The host refuses the merge when a person pushed a commit to the fix branch while the agent waited. The agent treats that refusal as final. The argument `expected_head_sha` is in `zeroroot-ai/connectors` on the branch `feat/fixloop-open-merge-request` and is not on `main` yet. If the connector returns no `head_sha`, the agent does not merge.
 
+The pin does not stop a commit that was on the branch before the coding job pushed. So the agent also reads `changed_files` of `merge_request_state`. It merges only when that set of paths equals the set that the coding job changed (`Delivery.ChangedFiles`). A mismatch is final (`foreign_change`). **The merge step does not merge today.** No harness call returns the paths that the coding job changed, so `Delivery.ChangedFiles` is empty and the outcome is `skipped`. The field `changed_files` is also not in `merge_request_state` yet. Both changes are listed in the open items.
+
 | Answer | Outcome | What the agent does |
 |---|---|---|
 | The result has `merged: true` | `merged` | Ends the pass. |
 | Refusal "merge not granted yet" | `waiting` | Calls again until `merge_wait` ends. |
 | A refusal that passes with time (pending authorization, audit record, failed merge check) | `waiting` | Calls again with a growing wait until `merge_wait` ends. |
 | The head of the merge request moved | `head_moved` | Does not call again. |
-| The connector gives no `head_sha` | `skipped` | Makes no merge call. |
+| The connector gives no `head_sha` or no `changed_files` | `skipped` | Makes no merge call. |
+| The paths of the merge request are not the paths of the coding job | `foreign_change` | Does not call again. |
+| The agent has no record of the paths of the coding job | `skipped` | Makes no call. This is the case today. |
 | The answer has no result object | none | The run fails. The agent does not send the call again. |
 | The host has not settled the merge status | `waiting` | Calls again until `merge_wait` ends. |
 | Refusal "not authorized to invoke tool" | `not_allowed` | Does not call again. The merge request stays open for a person. |
@@ -66,11 +70,12 @@ Gibson sets seven variables when it launches the image. See [AGENTS.md](./AGENTS
 These items need a change in another repo.
 
 1. **Merge grant.** No harness call returns the merge slot. The agent asks by calling the merge tool, and the daemon refuses the call until it granted the slot. See [How the merge works](#how-the-merge-works). The agent names the merge request with the key that the harness read returns in `merge_request`. The daemon fills that key under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). Until then the merge step is skipped and the merge request stays open.
-2. **Revert.** The daemon reverts a failed fix with its own client. See gibson#1465.
-3. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It reads that status, because the daemon caps a read at 500 rows. The SDK type `agent.ApplicationFinding` has the fields `MergeRequest` and `MergeRequestURL`. The agent reads the key from the row of the finding, and the daemon must fill it (see item 1). The agent does not read the mission output.
-4. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the agent cannot skip a finding with a block reason. A job that ends with no merge request is deferred with no reason, and the next pass tries the same finding again. A finding that the agent cannot fix by a rule still gets a reason (`Unfixed`). Gibson fills `fix_blocked_reason` under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). The SDK release that ships it comes after that.
-5. **A job in flight.** The daemon already holds one fix job for each finding (`FixClaimed`). A second dispatch for the same finding fails its mission. The agent reads that as a temporary fault and defers the finding. No change is needed in another repo.
-6. **A catalog mission.** The mission graph is built here. A checked-in catalog mission would be the one definition (ADR-0027).
+2. **Paths of the coding job.** The agent must know which paths the coding job changed, and no harness call returns them. The driver of the job knows them from the deliverable. Until a harness field carries them, the merge step reports `skipped`. The connectors change that adds `changed_files` to `merge_request_state` is also open.
+3. **Revert.** The daemon reverts a failed fix with its own client. See gibson#1465.
+4. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It reads that status, because the daemon caps a read at 500 rows. The SDK type `agent.ApplicationFinding` has the fields `MergeRequest` and `MergeRequestURL`. The agent reads the key from the row of the finding, and the daemon must fill it (see item 1). The agent does not read the mission output.
+5. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the agent cannot skip a finding with a block reason. A job that ends with no merge request is deferred with no reason, and the next pass tries the same finding again. A finding that the agent cannot fix by a rule still gets a reason (`Unfixed`). Gibson fills `fix_blocked_reason` under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). The SDK release that ships it comes after that.
+6. **A job in flight.** The daemon already holds one fix job for each finding (`FixClaimed`). A second dispatch for the same finding fails its mission. The agent reads that as a temporary fault and defers the finding. No change is needed in another repo.
+7. **A catalog mission.** The mission graph is built here. A checked-in catalog mission would be the one definition (ADR-0027).
 
 ## Develop
 

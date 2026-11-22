@@ -64,6 +64,8 @@ The agent does not read the mission output. The callback `WaitForMission` of the
 - The role `merge` of the tool. The daemon runs the call only when `World.MayMerge` finds a slot that `MergeGranted` granted. The slot binds the fix mission, and the parent mission may merge with it. The agent runs in the parent mission.
 - The refusal "merge not granted yet" is the only signal of the slot that an agent gets. The agent calls again until `merge_wait` ends.
 
+Before the call, the agent reads `head_sha` and `changed_files` of `merge_request_state`. It sends `head_sha` as `expected_head_sha`. It merges only when `changed_files` equals the paths that the coding job changed (`Delivery.ChangedFiles`). No harness call returns those paths yet, so the agent does not merge until one does (see the README).
+
 `internal/merge` holds this step. It also reads the refusal texts of the daemon. If the daemon changes a text, change the constants of that package and its test in the same PR.
 
 **Revert (gibson#1465).** The daemon calls `revert_merge_request` itself, with its own client, after a failed health signal that it read. The tool has the role `daemon`, so a call by an agent is refused. The agent has no revert code, and it must get none.
