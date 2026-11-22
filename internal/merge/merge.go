@@ -356,13 +356,12 @@ func request(id, mergeRequest, head string) (*structpb.Struct, error) {
 	return in, nil
 }
 
-// changedFile is one entry of changed_files.
+// changedFile is one entry of changed_files. The entry also holds change and
+// blob_sha. The agent reads them when the job record gives the blob ids of its
+// files.
 type changedFile struct {
-	Path string `json:"path"`
-	// Change is added, modified, deleted or renamed.
-	Change       string `json:"change"`
+	Path         string `json:"path"`
 	PreviousPath string `json:"previous_path"`
-	BlobSHA      string `json:"blob_sha"`
 }
 
 // paths returns the paths of the list. A renamed file counts under its new and
