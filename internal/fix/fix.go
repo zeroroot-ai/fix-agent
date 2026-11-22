@@ -62,6 +62,9 @@ type Finding struct {
 	PriorityReason string
 	Reachable      bool
 	Exposed        bool
+	// BlockedReason is why an earlier pass did not fix the Finding. It is empty
+	// when no pass gave up on it. A pass does not try a blocked Finding again.
+	BlockedReason string
 }
 
 // Repository is the one repository that the Application is built from.
@@ -126,6 +129,10 @@ type Summary struct {
 	Delivery Delivery
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
+	// Blocked lists the Findings that already carried a reason from an earlier
+	// pass. The pass sent none of them to the coding path and wrote no new
+	// reason.
+	Blocked []Skip
 	// Deferred lists the Findings whose coding job failed, was canceled, or
 	// gave no merge request within the settle time. They got no reason, so the
 	// next pass tries them again.
@@ -161,6 +168,11 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		if sum.Attempts >= MaxAttempts {
 			break
 		}
+		// A named Finding is an explicit request, so it ignores an old reason.
+		if f.BlockedReason != "" && only == "" {
+			sum.Blocked = append(sum.Blocked, Skip{Finding: f, Reason: f.BlockedReason})
+			continue
+		}
 		if v := Decide(f); !v.Fixable {
 			if err := skip(ctx, emitter, &sum, f, v.Reason); err != nil {
 				return sum, err
@@ -171,11 +183,10 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		del, err := coder.Fix(ctx, f, repo)
 		switch {
 		case errors.Is(err, ErrRetry):
-			// A job that ended with no merge request cannot get a block reason
-			// yet. The daemon does not fill fix_blocked_reason and the SDK does
-			// not return it, so the next pass would read the same finding again.
-			// When gibson#1579 ships, skip the finding with a reason here.
-			// See https://github.com/zeroroot-ai/gibson/issues/1579
+			// A job that ended with no merge request gets no block reason. The
+			// cause can be temporary, and a reason keeps the Finding out of the
+			// next pass. A Finding that carries a reason from the rule in
+			// Decide is skipped at the top of this loop (gibson#1579).
 			slog.Warn("coding job gave no merge request yet, no reason written", "finding", f.ID, "error", err)
 			sum.Deferred = append(sum.Deferred, Skip{Finding: f, Reason: err.Error()})
 			continue

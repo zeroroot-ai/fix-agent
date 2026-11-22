@@ -52,6 +52,10 @@ func New(src Findings) (*Reader, error) {
 // second coding job for it opens a second merge request. The check here does
 // not depend on the server filter.
 //
+// The row carries fix_blocked_reason when an earlier pass wrote one. The
+// reader keeps it in BlockedReason so that the pass does not start a coding job
+// for the same Finding again (gibson#1579).
+//
 // The server caps the read. An Application with a larger backlog gives the
 // first page. Each Finding in it is correct, and the pass fixes the highest
 // priority of the page.
@@ -85,6 +89,7 @@ func (r *Reader) OpenFindings(ctx context.Context, application string) ([]fix.Fi
 			PriorityReason: strings.TrimSpace(f.PriorityReason),
 			Reachable:      f.Reachable,
 			Exposed:        f.Reachable && f.Exposed,
+			BlockedReason:  strings.TrimSpace(f.FixBlockedReason),
 		})
 	}
 	return out, nil

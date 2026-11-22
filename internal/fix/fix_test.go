@@ -251,3 +251,48 @@ func TestDecide(t *testing.T) {
 		})
 	}
 }
+
+func TestPass_AFindingWithAnOldReasonStartsNoCodingJob(t *testing.T) {
+	blocked := finding("top", "P1")
+	blocked.BlockedReason = "the flaw is on a host"
+	coder, em := &fakeCoder{}, &fakeEmitter{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{blocked, finding("next", "P2")}}, coder, em)
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(coder.asked) != 1 || coder.asked[0] != "next" {
+		t.Fatalf("coding jobs = %v, want one for next and none for the blocked top", coder.asked)
+	}
+	if len(sum.Blocked) != 1 || sum.Blocked[0].Finding.ID != "top" || sum.Blocked[0].Reason != "the flaw is on a host" {
+		t.Errorf("blocked = %+v, want top with its old reason", sum.Blocked)
+	}
+	if len(em.reasons) != 0 {
+		t.Errorf("wrote reasons %v, want none: the reason is on the finding already", em.reasons)
+	}
+}
+
+func TestPass_BlockedFindingsDoNotUseTheAttemptBudget(t *testing.T) {
+	var in []fix.Finding
+	for i := range fix.MaxAttempts + 2 {
+		f := finding(string(rune('a'+i)), "P1")
+		f.BlockedReason = "old"
+		in = append(in, f)
+	}
+	in = append(in, finding("z", "P4"))
+	coder := &fakeCoder{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{findings: in}, coder, &fakeEmitter{})
+	if err != nil || sum.Delivered == nil || sum.Delivered.ID != "z" || len(sum.Blocked) != fix.MaxAttempts+2 {
+		t.Fatalf("err %v delivered %+v blocked %d, want z delivered after every blocked finding", err, sum.Delivered, len(sum.Blocked))
+	}
+}
+
+func TestPass_ANamedFindingIgnoresAnOldReason(t *testing.T) {
+	blocked := finding("top", "P1")
+	blocked.BlockedReason = "old"
+	coder := &fakeCoder{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "top", fakeReader{findings: []fix.Finding{blocked}}, coder, &fakeEmitter{})
+	if err != nil || sum.Delivered == nil || len(sum.Blocked) != 0 {
+		t.Fatalf("err %v delivered %+v blocked %v, want the named finding fixed", err, sum.Delivered, sum.Blocked)
+	}
+}

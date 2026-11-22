@@ -49,6 +49,18 @@ func TestOpenFindings_ReadsOnlyOpenAndMapsThePriority(t *testing.T) {
 	}
 }
 
+func TestOpenFindings_KeepsTheReasonOfAnEarlierPass(t *testing.T) {
+	src := &fakeFindings{out: []agent.ApplicationFinding{
+		{FindingID: "a", Status: "open", FixBlockedReason: " the flaw is on a host "},
+		{FindingID: "b", Status: "open"},
+	}}
+	r, _ := read.New(src)
+	got, err := r.OpenFindings(context.Background(), "p")
+	if err != nil || len(got) != 2 || got[0].BlockedReason != "the flaw is on a host" || got[1].BlockedReason != "" {
+		t.Fatalf("got %+v err %v, want the trimmed reason on a and none on b", got, err)
+	}
+}
+
 func TestOpenFindings_ExposedNeedsReachable(t *testing.T) {
 	src := &fakeFindings{out: []agent.ApplicationFinding{{FindingID: "f", Status: "open", Exposed: true}}}
 	r, _ := read.New(src)

@@ -188,6 +188,9 @@ func Report(app string, s fix.Summary) string {
 	} else {
 		b.WriteString("  no merge request opened")
 	}
+	for _, sk := range s.Blocked {
+		fmt.Fprintf(&b, "\n  blocked by an earlier pass %s: %s", sk.Finding.ID, sk.Reason)
+	}
 	for _, sk := range s.Skipped {
 		fmt.Fprintf(&b, "\n  not fixed %s: %s", sk.Finding.ID, sk.Reason)
 	}
