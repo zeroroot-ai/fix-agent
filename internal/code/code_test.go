@@ -256,7 +256,7 @@ func TestFix_TheDeliveryCarriesTheKeyOfTheMergeRequest(t *testing.T) {
 func TestFix_TheDeliveryCarriesTheHeadAndTheFilesThatTheDaemonRecorded(t *testing.T) {
 	m := &fakeHarness{
 		result: completed(), deliver: true, mergeRequest: "acme/portal!7", fixHead: " h1 ",
-		fixFiles: []agent.FixFile{{Path: "b.go", Change: "renamed", PreviousPath: "a.go", BlobSHA: "blob-b"}},
+		fixFiles: []agent.FixFile{{Path: "b.go", Change: "renamed", PreviousPath: "a.go", BlobSHA: "blob-b", Mode: "100755"}},
 	}
 	c, err := code.New(m, fast)
 	if err != nil {
@@ -264,7 +264,7 @@ func TestFix_TheDeliveryCarriesTheHeadAndTheFilesThatTheDaemonRecorded(t *testin
 	}
 	d, err := c.Fix(context.Background(), fnd, repo)
 	if err != nil || d.HeadSHA != "h1" || len(d.Files) != 1 ||
-		d.Files[0] != (fix.File{Path: "b.go", Change: "renamed", PreviousPath: "a.go", BlobSHA: "blob-b"}) {
+		d.Files[0] != (fix.File{Path: "b.go", Change: "renamed", PreviousPath: "a.go", BlobSHA: "blob-b", Mode: "100755"}) {
 		t.Fatalf("delivery = %+v err %v, want the head and the files of the row", d, err)
 	}
 	m = &fakeHarness{result: completed(), deliver: true, mergeRequest: "acme/portal!7"}

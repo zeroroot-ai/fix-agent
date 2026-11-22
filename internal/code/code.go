@@ -179,7 +179,7 @@ func (c *Coder) Fix(ctx context.Context, f fix.Finding, repo fix.Repository) (fi
 		HeadSHA: strings.TrimSpace(row.FixHeadSHA),
 	}
 	for _, f := range row.FixFiles {
-		d.Files = append(d.Files, fix.File{Path: f.Path, Change: f.Change, PreviousPath: f.PreviousPath, BlobSHA: f.BlobSHA})
+		d.Files = append(d.Files, fix.File{Path: f.Path, Change: f.Change, PreviousPath: f.PreviousPath, BlobSHA: f.BlobSHA, Mode: f.Mode})
 	}
 	return d, nil
 }
