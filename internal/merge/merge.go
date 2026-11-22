@@ -21,8 +21,20 @@
 // the Application has a free slot. No harness call returns the slot. The agent
 // asks by calling the tool. A refusal that says "merge not granted yet" means
 // that the slot is not granted. The agent waits and calls again until the Wait
-// bound ends. The daemon keeps the queue, so an agent that stops waiting loses
-// nothing: the merge request stays open.
+// bound ends. An agent that stops waiting leaves the merge request open, and
+// a slot that the daemon grants after that is not used. It blocks the other
+// fixes of the Application until MergeSlotHold ends (24 hours). The daemon
+// must re-dispatch the agent on MergeGranted, or free the slot when the run
+// ends. That change is in gibson, see gibson#1609.
+//
+// # The head of the merge request
+//
+// While the agent waits, a person with push access can add a commit to the fix
+// branch. So the agent reads head_sha of the merge request before it asks for
+// the merge, and it passes the value as expected_head_sha. The host refuses a
+// merge when the head moved, and the agent treats that refusal as final. The
+// tool argument expected_head_sha is in zeroroot-ai/connectors
+// feat/fixloop-open-merge-request. The tool in main has the argument sha.
 //
 // # What it leaves to the daemon
 //
@@ -47,6 +59,10 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+// ToolState is the connector tool that reads one merge request. The merge step
+// reads head_sha from it.
+const ToolState = "merge_request_state"
+
 // Tool is the connector tool that merges one merge request. Both Git host
 // connectors of Zero Root serve it (zeroroot-ai/connectors, github-fixloop and
 // gitlab-fixloop).
@@ -59,6 +75,10 @@ const ConnectorPrefix = "connector/"
 // run at their own speed, so the bound is long. It exists so that a queue that
 // never grants does not hold the sandbox open.
 const DefaultWait = 30 * time.Minute
+
+// MaxBackoff bounds the wait between two calls to this factor of Poll. The wait
+// doubles after each call that ends in a refusal that can pass.
+const MaxBackoff = 8
 
 // DefaultPoll is the time between two calls. The daemon reads the facts of the
 // fix loop on its own interval, so a faster call gives the same answer.
@@ -75,6 +95,12 @@ const (
 	textUnauthorized = "not authorized to invoke tool"
 	// textBlocked is in ErrBlocked, a tool that the mission policy blocks.
 	textBlocked = "blocked by mission policy"
+	// textPending is in ErrApprovalPending.
+	textPending = "pending authorization"
+	// textAudit is in ErrAuditUnavailable.
+	textAudit = "audit record of the call could not be written"
+	// textMergeCheck is in the error of a failed MayMerge read.
+	textMergeCheck = "the merge check of"
 	// textTransport starts the error of the SDK when the call did not reach
 	// the daemon.
 	textTransport = "CallToolProto callback failed"
@@ -116,12 +142,14 @@ func New(c Caller, cfg Config) (*Merger, error) {
 
 // ToolID returns the id of the merge tool of the connector in the form that
 // invoke_tool takes: mcp:<connector>:merge_merge_request.
-func ToolID(connectorRef string) (string, error) {
+func ToolID(connectorRef string) (string, error) { return toolID(connectorRef, Tool) }
+
+func toolID(connectorRef, tool string) (string, error) {
 	name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(connectorRef), ConnectorPrefix))
 	if name == "" || strings.ContainsAny(name, ": \t\n") {
 		return "", fmt.Errorf("merge: the connector reference %q is not of the form %s<name>", connectorRef, ConnectorPrefix)
 	}
-	return "mcp:" + name + ":" + Tool, nil
+	return "mcp:" + name + ":" + tool, nil
 }
 
 // Merge asks the connector to merge the merge request of the delivery. It
@@ -138,38 +166,88 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 	if err != nil {
 		return fix.Merge{}, err
 	}
-	in, err := request(id, d.MergeRequest)
+	head, early, err := m.head(ctx, repo, d.MergeRequest)
+	if err != nil || early != nil {
+		return derefMerge(early), err
+	}
+	in, err := request(id, d.MergeRequest, head)
 	if err != nil {
 		return fix.Merge{}, err
 	}
 	deadline := time.Now().Add(m.cfg.Wait)
+	delay := m.cfg.Poll
 	for {
 		out := &structpb.Struct{}
 		cerr := m.c.CallToolProto(ctx, "invoke_tool", in, out)
-		res, again, jerr := judge(out, cerr)
+		res, again, jerr := judge(out, cerr, head)
 		if jerr != nil {
 			return fix.Merge{}, jerr
 		}
 		if !again {
 			return res, nil
 		}
-		if !time.Now().Add(m.cfg.Poll).Before(deadline) {
+		if !time.Now().Add(delay).Before(deadline) {
 			return res, nil
 		}
-		t := time.NewTimer(m.cfg.Poll)
+		t := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			t.Stop()
 			return fix.Merge{}, fmt.Errorf("merge: wait for the merge slot: %w", ctx.Err())
 		case <-t.C:
 		}
+		// A refusal that passes with time can last, so the wait grows.
+		delay = min(delay*2, m.cfg.Poll*MaxBackoff)
 	}
 }
 
-func request(id, mergeRequest string) (*structpb.Struct, error) {
+func derefMerge(m *fix.Merge) fix.Merge {
+	if m == nil {
+		return fix.Merge{}
+	}
+	return *m
+}
+
+// head reads head_sha of the merge request. It returns an outcome and no head
+// when the agent must not ask for the merge: the connector gave no head_sha, or
+// the read was refused.
+func (m *Merger) head(ctx context.Context, repo fix.Repository, key string) (string, *fix.Merge, error) {
+	id, err := toolID(repo.ConnectorRef, ToolState)
+	if err != nil {
+		return "", nil, err
+	}
+	in, err := structpb.NewStruct(map[string]any{"id": id, "args": map[string]any{"merge_request": key}})
+	if err != nil {
+		return "", nil, fmt.Errorf("merge: build the request: %w", err)
+	}
+	out := &structpb.Struct{}
+	if cerr := m.c.CallToolProto(ctx, "invoke_tool", in, out); cerr != nil {
+		res, _, rerr := refusal(cerr)
+		if rerr != nil {
+			return "", nil, rerr
+		}
+		if res.State == fix.MergeWaiting {
+			res = fix.Merge{State: fix.MergeRefused, Reason: "the read of the merge request failed: " + cerr.Error()}
+		}
+		return "", &res, nil
+	}
+	r, jerr := result(out)
+	if jerr != nil {
+		return "", nil, jerr
+	}
+	if r.HeadSHA == "" {
+		return "", &fix.Merge{
+			State:  fix.MergeSkipped,
+			Reason: "the connector returned no head_sha, so the agent cannot bind the merge to the head that it saw",
+		}, nil
+	}
+	return r.HeadSHA, nil, nil
+}
+
+func request(id, mergeRequest, head string) (*structpb.Struct, error) {
 	in, err := structpb.NewStruct(map[string]any{
 		"id":   id,
-		"args": map[string]any{"merge_request": mergeRequest},
+		"args": map[string]any{"merge_request": mergeRequest, "expected_head_sha": head},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("merge: build the request: %w", err)
@@ -177,29 +255,53 @@ func request(id, mergeRequest string) (*structpb.Struct, error) {
 	return in, nil
 }
 
+// toolResult is the result object of a connector tool.
+type toolResult struct {
+	Merged  bool   `json:"merged"`
+	State   string `json:"state"`
+	Reason  string `json:"reason"`
+	HeadSHA string `json:"head_sha"`
+}
+
+// result reads the result object of an invoke_tool answer. An answer with no
+// result object is an error: the agent cannot tell what the daemon did, so it
+// does not ask again.
+func result(out *structpb.Struct) (toolResult, error) {
+	v, ok := out.GetFields()["result"]
+	if !ok || v.GetStructValue() == nil {
+		return toolResult{}, errors.New("merge: the answer of invoke_tool has no result object")
+	}
+	raw, err := protojson.Marshal(v.GetStructValue())
+	if err != nil {
+		return toolResult{}, fmt.Errorf("merge: read the result of the tool: %w", err)
+	}
+	var r toolResult
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return toolResult{}, fmt.Errorf("merge: read the result of the tool: %w", err)
+	}
+	return r, nil
+}
+
 // judge reads one answer of invoke_tool. again is true when the same call can
-// succeed later: the slot is not granted yet, or the host has not settled the
-// merge status. A non-nil error means that the call did not reach the daemon,
-// or that the answer is not an object.
-func judge(out *structpb.Struct, err error) (m fix.Merge, again bool, _ error) {
+// succeed later: the slot is not granted yet, a check of the daemon failed for
+// now, or the host has not settled the merge status. A non-nil error means that
+// the call did not reach the daemon, or that the answer is not usable.
+func judge(out *structpb.Struct, err error, head string) (m fix.Merge, again bool, _ error) {
 	if err != nil {
 		return refusal(err)
 	}
-	raw, jerr := protojson.Marshal(out.GetFields()["result"].GetStructValue())
-	if jerr != nil {
-		return fix.Merge{}, false, fmt.Errorf("merge: read the result of the merge tool: %w", jerr)
-	}
-	var r struct {
-		Merged bool   `json:"merged"`
-		State  string `json:"state"`
-		Reason string `json:"reason"`
-	}
-	if uerr := json.Unmarshal(raw, &r); uerr != nil {
-		return fix.Merge{}, false, fmt.Errorf("merge: read the result of the merge tool: %w", uerr)
+	r, rerr := result(out)
+	if rerr != nil {
+		return fix.Merge{}, false, rerr
 	}
 	switch {
 	case r.Merged:
 		return fix.Merge{State: fix.MergeDone}, false, nil
+	case r.HeadSHA != "" && !strings.EqualFold(r.HeadSHA, head):
+		return fix.Merge{
+			State:  fix.MergeHeadMoved,
+			Reason: "the head of the merge request moved from " + head + " to " + r.HeadSHA + ", so the agent did not merge it",
+		}, false, nil
 	case r.State == "refused" || r.State == "closed":
 		return fix.Merge{State: fix.MergeRefused, Reason: hostReason(r.State, r.Reason)}, false, nil
 	}
@@ -215,6 +317,9 @@ func refusal(err error) (m fix.Merge, again bool, _ error) {
 		return fix.Merge{}, false, fmt.Errorf("merge: %w", err)
 	case strings.Contains(msg, textNotGranted):
 		return fix.Merge{State: fix.MergeWaiting, Reason: "the daemon has not granted the merge slot"}, true, nil
+	case strings.Contains(msg, textPending), strings.Contains(msg, textAudit), strings.Contains(msg, textMergeCheck):
+		// These refusals pass with time. Call again inside the Wait bound.
+		return fix.Merge{State: fix.MergeWaiting, Reason: "the daemon could not allow the call now: " + msg}, true, nil
 	case strings.Contains(msg, textUnauthorized), strings.Contains(msg, textBlocked):
 		return fix.Merge{
 			State:  fix.MergeNotAllowed,

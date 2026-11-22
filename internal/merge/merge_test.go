@@ -26,13 +26,23 @@ type gate struct {
 	granted    bool // the agent holds can_execute on the connector
 	slotAfter  int  // the slot is granted from this call on (1 is the first call)
 	hostAnswer map[string]any
-	calls      int
-	got        []map[string]any
-	transport  error
+	// calls counts the merge calls. reads counts the reads of the state.
+	calls, reads int
+	got          []map[string]any
+	transport    error
+
+	// head is the head_sha that merge_request_state returns. Empty with
+	// noHead false means "h1".
+	head   string
+	noHead bool
+	// transient is the refusal text for the first transientN merge calls.
+	transient  string
+	transientN int
+	// emptyReply makes the merge call answer with no result object.
+	emptyReply bool
 }
 
 func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.Message, _ ...agent.ToolCallOption) error {
-	g.calls++
 	if g.transport != nil {
 		return g.transport
 	}
@@ -40,7 +50,31 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 	if name != "invoke_tool" || in == nil {
 		return errors.New("unexpected call " + name)
 	}
+	if id, _ := in.AsMap()["id"].(string); strings.HasSuffix(id, ":merge_request_state") {
+		g.reads++
+		head := g.head
+		if head == "" {
+			head = "h1"
+		}
+		res := map[string]any{"state": "open"}
+		if !g.noHead {
+			res["head_sha"] = head
+		}
+		out, err := structpb.NewStruct(map[string]any{"result": res})
+		if err != nil {
+			return fmt.Errorf("build the answer: %w", err)
+		}
+		protolib.Merge(resp, out)
+		return nil
+	}
+	g.calls++
 	g.got = append(g.got, in.AsMap())
+	if g.emptyReply {
+		return nil
+	}
+	if g.calls <= g.transientN {
+		return errors.New(g.transient)
+	}
 	if !g.granted {
 		return errors.New("CallToolProto error: metatool: not authorized to invoke tool: " + in.AsMap()["id"].(string))
 	}
@@ -225,5 +259,92 @@ func TestToolID(t *testing.T) {
 func TestNew_NoCaller(t *testing.T) {
 	if _, err := merge.New(nil, merge.Config{}); err == nil {
 		t.Fatal("want an error for no caller")
+	}
+}
+
+func TestMerge_SendsTheHeadThatItReadAsExpectedHeadSha(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, head: "abc123"}
+	if got, err := run(t, g, fast, delivery); err != nil || got.State != fix.MergeDone {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+	args, _ := g.got[0]["args"].(map[string]any)
+	if g.reads != 1 || args["expected_head_sha"] != "abc123" {
+		t.Fatalf("reads %d args %v, want one read and expected_head_sha abc123", g.reads, args)
+	}
+}
+
+// A person pushes a commit while the agent waits. The host refuses and names
+// the new head. The refusal is final: one merge call.
+func TestMerge_APushedCommitIsAFinalRefusal(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, head: "h1", hostAnswer: map[string]any{
+		"state": "open", "merged": false, "head_sha": "h2-pushed",
+		"reason": "the head of the pull request moved: expected h1, now h2-pushed. A push changed it.",
+	}}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeHeadMoved || g.calls != 1 || !strings.Contains(got.Reason, "h2-pushed") {
+		t.Fatalf("got %+v err %v after %d calls, want head_moved after one call", got, err, g.calls)
+	}
+}
+
+func TestMerge_NoHeadShaMeansNoMergeCall(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, noHead: true}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeSkipped || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d calls, want skipped with no merge call", got, err, g.calls)
+	}
+}
+
+func TestMerge_ARefusedStateReadIsAnOutcome(t *testing.T) {
+	m, _ := merge.New(failing{errors.New("CallToolProto error: metatool: not authorized to invoke tool: x")}, fast)
+	got, err := m.Merge(context.Background(), repo, delivery)
+	if err != nil || got.State != fix.MergeNotAllowed {
+		t.Fatalf("got %+v err %v, want not_allowed", got, err)
+	}
+}
+
+// These refusals pass with time. The agent retries them inside the wait.
+func TestMerge_RefusalsThatPassWithTimeAreRetried(t *testing.T) {
+	for name, text := range map[string]string{
+		"audit":   "CallToolProto error: the audit record of the call could not be written",
+		"pending": "CallToolProto error: metatool: pending authorization: a person must approve this call before it runs",
+		"check":   "CallToolProto error: metatool: the merge check of x:merge_merge_request failed: world unavailable",
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &gate{granted: true, slotAfter: 1, transient: text, transientN: 3}
+			got, err := run(t, g, fast, delivery)
+			if err != nil || got.State != fix.MergeDone || g.calls != 4 {
+				t.Fatalf("got %+v err %v after %d calls, want merged on the fourth call", got, err, g.calls)
+			}
+		})
+	}
+}
+
+func TestMerge_ATransientRefusalThatNeverPassesEndsAsWaiting(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, transient: "CallToolProto error: the audit record of the call could not be written", transientN: 1 << 30}
+	got, err := run(t, g, merge.Config{Wait: 40 * time.Millisecond, Poll: 2 * time.Millisecond}, delivery)
+	if err != nil || got.State != fix.MergeWaiting {
+		t.Fatalf("got %+v err %v, want waiting", got, err)
+	}
+}
+
+// The wait between two calls grows. With a poll of 4 ms and a wait of 100 ms a
+// fixed poll makes about 25 calls, and a growing one makes far fewer.
+func TestMerge_TheWaitBetweenCallsGrows(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1 << 30}
+	if _, err := run(t, g, merge.Config{Wait: 100 * time.Millisecond, Poll: 4 * time.Millisecond}, delivery); err != nil {
+		t.Fatal(err)
+	}
+	if g.calls > 10 {
+		t.Fatalf("calls = %d, want fewer than 10 with a growing wait", g.calls)
+	}
+}
+
+// An answer with no result object is an error, and the agent does not send the
+// call again.
+func TestMerge_AnAnswerWithNoResultObjectIsAnErrorAndIsNotResent(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, emptyReply: true}
+	_, err := run(t, g, fast, delivery)
+	if err == nil || !strings.Contains(err.Error(), "no result object") || g.calls != 1 {
+		t.Fatalf("err %v after %d calls, want an error after one call", err, g.calls)
 	}
 }

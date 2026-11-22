@@ -32,12 +32,18 @@ The agent merges its own fix on a green pipeline. No person acts. Three checks o
 2. The manifest of the connector gives the tool `merge_merge_request` the role `merge`. The daemon runs the call only when the World of the tenant holds a granted slot for the merge request. The slot comes from `MergeGranted`, after the pipeline is green and no other fix of the Application holds a slot.
 3. The slot binds the fix mission. Only a call from the mission that started the fix mission may merge with it. The agent runs in that mission.
 
-The agent calls `invoke_tool` with the id `mcp:<connector>:merge_merge_request` and the argument `merge_request`. A refusal "merge not granted yet" means that the slot is not granted. The agent calls again every 15 seconds until `merge_wait` ends (default 30 minutes). The daemon keeps the queue, so the merge request stays open when the wait ends.
+The agent calls `invoke_tool` with the id `mcp:<connector>:merge_merge_request` and the argument `merge_request`. A refusal "merge not granted yet" means that the slot is not granted. The agent calls again every 15 seconds until `merge_wait` ends (default 30 minutes). When the wait ends, the merge request stays open. A slot that the daemon grants after that is not used, and it blocks the other fixes of the Application until `MergeSlotHold` ends (24 hours). The daemon must re-dispatch the agent on `MergeGranted`, or free the slot when the run ends. That change is in gibson (gibson#1609).
+
+Before the first merge call, the agent reads `head_sha` of the merge request with `merge_request_state`. It sends the value as `expected_head_sha`. The host refuses the merge when a person pushed a commit to the fix branch while the agent waited. The agent treats that refusal as final. The argument `expected_head_sha` is in `zeroroot-ai/connectors` on the branch `feat/fixloop-open-merge-request` and is not on `main` yet. If the connector returns no `head_sha`, the agent does not merge.
 
 | Answer | Outcome | What the agent does |
 |---|---|---|
 | The result has `merged: true` | `merged` | Ends the pass. |
 | Refusal "merge not granted yet" | `waiting` | Calls again until `merge_wait` ends. |
+| A refusal that passes with time (pending authorization, audit record, failed merge check) | `waiting` | Calls again with a growing wait until `merge_wait` ends. |
+| The head of the merge request moved | `head_moved` | Does not call again. |
+| The connector gives no `head_sha` | `skipped` | Makes no merge call. |
+| The answer has no result object | none | The run fails. The agent does not send the call again. |
 | The host has not settled the merge status | `waiting` | Calls again until `merge_wait` ends. |
 | Refusal "not authorized to invoke tool" | `not_allowed` | Does not call again. The merge request stays open for a person. |
 | The host refuses, for example the branch protection | `refused` | Does not call again. The finding stays `fixing`, and the daemon records the reason. |

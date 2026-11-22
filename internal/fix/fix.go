@@ -118,7 +118,7 @@ const (
 	// MergeDone means that the connector merged the merge request.
 	MergeDone MergeState = "merged"
 	// MergeWaiting means that the daemon granted no merge slot while the agent
-	// waited. The merge request stays open. The daemon keeps the queue.
+	// waited. The merge request stays open. A slot that the daemon grants later is not used (gibson#1609).
 	MergeWaiting MergeState = "waiting"
 	// MergeNotAllowed means that the agent holds no merge grant. The merge
 	// request stays open for a person.
@@ -126,6 +126,10 @@ const (
 	// MergeRefused means that the Git host refused the merge, for example the
 	// branch protection. The daemon reads the reason and records it.
 	MergeRefused MergeState = "refused"
+	// MergeHeadMoved means that the head of the merge request changed after the
+	// agent read it, for example a person pushed a commit. The host refused the
+	// merge and the refusal is final.
+	MergeHeadMoved MergeState = "head_moved"
 	// MergeSkipped means that the agent did not try, because it did not know
 	// the key of the merge request.
 	MergeSkipped MergeState = "skipped"

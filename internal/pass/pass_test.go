@@ -55,6 +55,15 @@ func (f *fakePlatform) CallToolProto(_ context.Context, name string, req, resp p
 	if name != "invoke_tool" || in == nil {
 		return errors.New("unexpected tool " + name)
 	}
+	if id, _ := in.AsMap()["id"].(string); strings.HasSuffix(id, ":merge_request_state") {
+		state, err := answer(map[string]any{"state": "open", "head_sha": "h1"})
+		if err != nil {
+			return err
+		}
+		protolib.Reset(resp)
+		protolib.Merge(resp, state)
+		return nil
+	}
 	f.calls = append(f.calls, in)
 	merge := f.merge
 	if merge == nil {
