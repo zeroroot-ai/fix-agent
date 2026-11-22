@@ -111,6 +111,9 @@ type File struct {
 	Change       string
 	PreviousPath string
 	BlobSHA      string
+	// Mode is the file mode that the daemon recorded, for example 100644. It is
+	// empty when the daemon records none.
+	Mode string
 }
 
 // Reader returns the open Findings of one Application.
@@ -141,16 +144,19 @@ const (
 	// MergeRefused means that the Git host refused the merge, for example the
 	// branch protection. The daemon reads the reason and records it.
 	MergeRefused MergeState = "refused"
-	// MergeHeadMoved means that the head of the merge request changed after the
-	// agent read it, for example a person pushed a commit. The host refused the
-	// merge and the refusal is final.
+	// MergeHeadMoved means that the head of the merge request is not the head
+	// that the daemon recorded, for example a person pushed a commit. The agent
+	// saw it in the state or the host refused the merge. The refusal is final.
 	MergeHeadMoved MergeState = "head_moved"
-	// MergeForeignChange means that the paths of the merge request are not the
-	// paths that the coding job changed, for example a person committed to the
-	// branch before the job pushed. The refusal is final.
+	// MergeForeignChange means that the files of the merge request are not the
+	// files that the daemon recorded for the fix, for example a person committed
+	// to the branch before the job pushed. It also covers a change of mode, a
+	// list that the host cut and a list that the host did not give. The refusal
+	// is final.
 	MergeForeignChange MergeState = "foreign_change"
-	// MergeSkipped means that the agent did not try, because it did not know
-	// the key of the merge request.
+	// MergeSkipped means that the agent made no merge call, because the daemon
+	// recorded no key, no head or no files for the merge request, or the
+	// connector returned no head.
 	MergeSkipped MergeState = "skipped"
 )
 

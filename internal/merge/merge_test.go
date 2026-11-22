@@ -248,17 +248,26 @@ func TestMerge_AnOpenMergeRequestThatTheHostHasNotSettledIsCalledAgain(t *testin
 }
 
 func TestMerge_AnyOtherToolErrorIsARefusal(t *testing.T) {
-	g := &gate{granted: true, slotAfter: 1}
-	m, _ := merge.New(failing{&agent.ToolCallError{Code: "ERROR_CODE_INVALID_ARGUMENT", Message: "merge_request must be a pull request URL"}}, fast)
+	calls := 0
+	m, _ := merge.New(failing{
+		err:   &agent.ToolCallError{Code: "ERROR_CODE_INVALID_ARGUMENT", Message: "merge_request must be a pull request URL"},
+		calls: &calls,
+	}, fast)
 	got, err := m.Merge(context.Background(), repo, delivery)
-	if err != nil || got.State != fix.MergeRefused || !strings.Contains(got.Reason, "pull request URL") {
-		t.Fatalf("got %+v err %v (%d calls), want refused with the text of the tool", got, err, g.calls)
+	if err != nil || got.State != fix.MergeRefused || !strings.Contains(got.Reason, "pull request URL") || calls != 1 {
+		t.Fatalf("got %+v err %v after %d calls, want refused with the text of the tool after one call", got, err, calls)
 	}
 }
 
-type failing struct{ err error }
+type failing struct {
+	err   error
+	calls *int
+}
 
 func (f failing) CallToolProto(context.Context, string, protolib.Message, protolib.Message, ...agent.ToolCallOption) error {
+	if f.calls != nil {
+		*f.calls++
+	}
 	return f.err
 }
 
@@ -313,7 +322,7 @@ func TestNew_NoCaller(t *testing.T) {
 	}
 }
 
-func TestMerge_SendsTheHeadThatItReadAsExpectedHeadSha(t *testing.T) {
+func TestMerge_SendsTheRecordedHeadAsExpectedHeadSha(t *testing.T) {
 	g := &gate{granted: true, slotAfter: 1, head: "abc123"}
 	d := delivery
 	d.HeadSHA = "abc123"
@@ -359,7 +368,7 @@ func TestMerge_NoHeadShaMeansNoMergeCall(t *testing.T) {
 }
 
 func TestMerge_ARefusedStateReadIsAnOutcome(t *testing.T) {
-	m, _ := merge.New(failing{denied("metatool: not authorized to invoke tool: x")}, fast)
+	m, _ := merge.New(failing{err: denied("metatool: not authorized to invoke tool: x")}, fast)
 	got, err := m.Merge(context.Background(), repo, delivery)
 	if err != nil || got.State != fix.MergeNotAllowed {
 		t.Fatalf("got %+v err %v, want not_allowed", got, err)
@@ -422,7 +431,7 @@ func TestMerge_ABranchWithAForeignCommitIsAFinalRefusal(t *testing.T) {
 	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 {
 		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change and no merge call", got, err, g.calls)
 	}
-	if !strings.Contains(got.Reason, "deploy/secrets.yaml") {
+	if !strings.Contains(got.Reason, "deploy/secrets.yaml is not a file of the fix") {
 		t.Errorf("reason %q does not name the foreign path", got.Reason)
 	}
 }
@@ -580,9 +589,120 @@ func TestMerge_AnErrorThatIsNotAToolCallErrorIsReturned(t *testing.T) {
 // The code decides and the words do not. The same words with another code do
 // not change the outcome.
 func TestMerge_TheCodeDecidesAndNotTheText(t *testing.T) {
-	m, _ := merge.New(failing{&agent.ToolCallError{Code: agent.ToolErrPermissionDenied, Message: "merge not granted yet"}}, fast)
+	m, _ := merge.New(failing{err: &agent.ToolCallError{Code: agent.ToolErrPermissionDenied, Message: "merge not granted yet"}}, fast)
 	got, err := m.Merge(context.Background(), repo, delivery)
 	if err != nil || got.State != fix.MergeNotAllowed {
 		t.Fatalf("got %+v err %v, want not_allowed", got, err)
+	}
+}
+
+// The rename has the same change and the same blob, and another previous path.
+func TestMerge_ARenameFromAnotherPathIsAFinalRefusal(t *testing.T) {
+	d := delivery
+	d.Files = []fix.File{
+		{Path: "a.go", Change: "modified", BlobSHA: "blob-a.go"},
+		{Path: "b_test.go", Change: "renamed", PreviousPath: "internal/old_b_test.go", BlobSHA: "blob-b_test.go"},
+	}
+	other := file("b_test.go", "renamed")
+	other["previous_path"] = "internal/another_b_test.go"
+	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), other}}
+	got, err := run(t, g, fast, d)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "b_test.go differs") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
+	}
+}
+
+// The path is a file of the fix and the entry is a change of the mode. Every
+// other field equals the record, so only the mode rule can refuse it.
+func TestMerge_AModeChangeOnAPathOfTheFixIsAFinalRefusal(t *testing.T) {
+	d := delivery
+	d.Files = []fix.File{
+		{Path: "a.go", Change: "mode_changed", BlobSHA: "blob-a.go"},
+		{Path: "b_test.go", Change: "added", BlobSHA: "blob-b_test.go"},
+	}
+	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "mode_changed"), file("b_test.go", "added")}}
+	got, err := run(t, g, fast, d)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "a.go changes the mode") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change for the mode change", got, err, g.calls)
+	}
+}
+
+// A deleted file has no mode at the head. A mode that the host shows for it does
+// not refuse the merge.
+func TestMerge_ADeletedFileIsMergedWhateverModeTheHostShows(t *testing.T) {
+	d := delivery
+	d.Files = []fix.File{
+		{Path: "a.go", Change: "modified", BlobSHA: "blob-a.go"},
+		{Path: "old.go", Change: "deleted"},
+	}
+	gone := map[string]any{"path": "old.go", "change": "deleted", "blob_sha": "", "mode": "000000"}
+	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), gone}}
+	if got, err := run(t, g, fast, d); err != nil || got.State != fix.MergeDone {
+		t.Fatalf("got %+v err %v, want merged", got, err)
+	}
+	// The same entry for a file that is not deleted is a refusal.
+	d.Files[1] = fix.File{Path: "old.go", Change: "modified"}
+	gone["change"] = "modified"
+	g = &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), gone}}
+	if got, err := run(t, g, fast, d); err != nil || got.State != fix.MergeForeignChange {
+		t.Fatalf("got %+v err %v, want foreign_change for the mode 000000", got, err)
+	}
+}
+
+// When the daemon records a mode and the host gives one, they must be equal.
+func TestMerge_AModeThatDiffersFromTheRecordedModeIsAFinalRefusal(t *testing.T) {
+	d := delivery
+	d.Files = []fix.File{
+		{Path: "a.go", Change: "modified", BlobSHA: "blob-a.go", Mode: "100755"},
+		{Path: "b_test.go", Change: "added", BlobSHA: "blob-b_test.go", Mode: "100644"},
+	}
+	// The host shows 100644 for a.go, and the daemon recorded 100755.
+	g := &gate{granted: true, slotAfter: 1}
+	got, err := run(t, g, fast, d)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "recorded 100755") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
+	}
+	// The recorded mode that equals the mode of the host is not a refusal.
+	d.Files[0].Mode = "100644"
+	g = &gate{granted: true, slotAfter: 1}
+	if got, err = run(t, g, fast, d); err != nil || got.State != fix.MergeDone {
+		t.Fatalf("got %+v err %v, want merged", got, err)
+	}
+}
+
+// hang blocks until its context ends, as a call that never answers.
+type hang struct{ calls *int }
+
+func (h hang) CallToolProto(ctx context.Context, _ string, _, _ protolib.Message, _ ...agent.ToolCallOption) error {
+	*h.calls++
+	<-ctx.Done()
+	return fmt.Errorf("hung call: %w", ctx.Err())
+}
+
+// A call that never answers ends at its own bound, and the step ends inside
+// merge_wait with the merge request open.
+func TestMerge_AHungCallEndsAtItsOwnBoundInsideTheWait(t *testing.T) {
+	calls := 0
+	m, _ := merge.New(hang{calls: &calls}, merge.Config{Wait: 200 * time.Millisecond, Poll: time.Millisecond, CallTimeout: 20 * time.Millisecond})
+	start := time.Now()
+	got, err := m.Merge(context.Background(), repo, delivery)
+	if err != nil || got.State != fix.MergeWaiting || calls < 2 {
+		t.Fatalf("got %+v err %v after %d calls, want waiting after more than one call", got, err, calls)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the step took %v, want it to end inside the wait", d)
+	}
+}
+
+// The call bound is never longer than what is left of the wait.
+func TestMerge_ACallBoundDoesNotOutliveTheWait(t *testing.T) {
+	calls := 0
+	m, _ := merge.New(hang{calls: &calls}, merge.Config{Wait: 50 * time.Millisecond, Poll: time.Millisecond, CallTimeout: time.Hour})
+	start := time.Now()
+	if got, err := m.Merge(context.Background(), repo, delivery); err != nil || got.State != fix.MergeWaiting {
+		t.Fatalf("got %+v err %v, want waiting", got, err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the step took %v, want it to end with the wait of 50 ms", d)
 	}
 }

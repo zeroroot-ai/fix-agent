@@ -53,7 +53,7 @@ The agent does not read the mission output. The callback `WaitForMission` of the
 
 - It never states that a fix worked. The agent ends after the merge step. The daemon reads the merge state, the deploy and the health signal through the connector of the tenant. The daemon sets `fixed`, `verified` or the revert.
 - It never writes the status of a finding.
-- It never calls a connector tool of the Git host except `merge_merge_request`, and only through `invoke_tool` (see the next section).
+- It never calls a connector tool of the Git host except `merge_request_state` (a read) and `merge_merge_request`, and only through `invoke_tool` (see the next section).
 - It never calls `revert_merge_request`. Only the daemon reverts.
 
 ## Merge, and the revert that is not here
