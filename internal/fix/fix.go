@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 )
 
 // MaxAttempts bounds the coding jobs that one pass starts. A coding job is
@@ -218,8 +219,8 @@ type Summary struct {
 	ResumedDelivery Delivery
 	// ResumedMerge is the outcome of the merge step for Resumed.
 	ResumedMerge Merge
-	// Passed lists the pending merges that ended with a final outcome and no
-	// merge call before Resumed. The pass went on to the next pending merge.
+	// Passed lists the pending merges that ended with a final outcome before
+	// Resumed, or all of them when none counted. The pass went on to the next pending merge.
 	Passed []Resumption
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
@@ -239,9 +240,47 @@ type Resumption struct {
 }
 
 // counts says if a merge step is the one merge step of the pass. A step that
-// sent the merge call or waited for the slot is. A final outcome that sent no
-// call is not, and the pass goes on to the next merge request.
-func (m Merge) counts() bool { return m.Called || m.State == MergeWaiting }
+// waited for the slot is, and a step that merged with a merge call is. A final
+// outcome is not, and the pass goes on to the next merge request. This holds
+// for a final refusal after a merge call too, so a merge request that the
+// branch protection refuses does not starve the next one.
+func (m Merge) counts() bool {
+	return m.State == MergeWaiting || (m.State == MergeDone && m.Called)
+}
+
+// MergeBudget is the one wait budget that all pending merge steps of a pass
+// share. The first step that reads the deadline starts it.
+type MergeBudget struct {
+	deadline time.Time
+	started  bool
+}
+
+// Deadline returns the end of the budget. The first call sets it to wait from
+// now, and each later call returns the same time.
+func (b *MergeBudget) Deadline(wait time.Duration) time.Time {
+	if !b.started {
+		b.deadline, b.started = time.Now().Add(wait), true
+	}
+	return b.deadline
+}
+
+// Spent says if the budget started and its time is used.
+func (b *MergeBudget) Spent() bool { return b.started && !time.Now().Before(b.deadline) }
+
+type budgetKey struct{}
+
+// WithMergeBudget returns a context that carries the budget. A Merger that
+// finds a budget in its context waits until the end of the budget and not for
+// its own bound.
+func WithMergeBudget(ctx context.Context, b *MergeBudget) context.Context {
+	return context.WithValue(ctx, budgetKey{}, b)
+}
+
+// MergeBudgetFrom returns the budget of the context, or nil.
+func MergeBudgetFrom(ctx context.Context) *MergeBudget {
+	b, _ := ctx.Value(budgetKey{}).(*MergeBudget)
+	return b
+}
 
 // Pass runs one pass over one Application.
 //
@@ -272,16 +311,22 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 	// can come after that run ended, so this pass merges the one of the
 	// highest priority. The pass makes at most one merge call.
 	merged := false
+	budget := &MergeBudget{}
+	pctx := WithMergeBudget(ctx, budget)
 	for _, p := range rankPending(pending) {
+		if budget.Spent() {
+			// All pending merge steps share one wait budget.
+			break
+		}
 		slog.Info("resume the merge of an open merge request", "finding", p.Finding.ID, "merge_request", p.Delivery.MergeRequest)
-		m, err := merger.Merge(ctx, repo, p.Delivery)
+		m, err := merger.Merge(pctx, repo, p.Delivery)
 		if err != nil {
 			return sum, fmt.Errorf("fix: merge the open merge request of finding %s: %w", p.Finding.ID, err)
 		}
 		slog.Info("merge step ended", "finding", p.Finding.ID, "state", m.State, "reason", m.Reason, "called", m.Called)
 		f := p.Finding
-		sum.Resumed, sum.ResumedDelivery, sum.ResumedMerge = &f, p.Delivery, m
 		if m.counts() {
+			sum.Resumed, sum.ResumedDelivery, sum.ResumedMerge = &f, p.Delivery, m
 			merged = true
 			break
 		}

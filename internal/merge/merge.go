@@ -181,7 +181,12 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 	if err != nil {
 		return fix.Merge{}, err
 	}
-	w := &backoff{deadline: time.Now().Add(m.cfg.Wait), delay: m.cfg.Poll, max: m.cfg.Poll * MaxBackoff}
+	deadline := time.Now().Add(m.cfg.Wait)
+	if b := fix.MergeBudgetFrom(ctx); b != nil {
+		// The pending merge steps of one pass share one wait budget.
+		deadline = b.Deadline(m.cfg.Wait)
+	}
+	w := &backoff{deadline: deadline, delay: m.cfg.Poll, max: m.cfg.Poll * MaxBackoff}
 	var head string
 	for {
 		h, early, again, herr := m.head(ctx, repo, d, w)

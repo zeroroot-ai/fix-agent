@@ -739,3 +739,18 @@ func TestMerge_SaysIfItSentTheMergeCall(t *testing.T) {
 		t.Fatalf("got %+v, want head_moved with no call", got)
 	}
 }
+
+func TestMerge_AMergeBudgetInTheContextBoundsTheWait(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1 << 30}
+	m, err := merge.New(g, merge.Config{Wait: time.Hour, Poll: time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b := &fix.MergeBudget{}
+	b.Deadline(30 * time.Millisecond)
+	start := time.Now()
+	got, err := m.Merge(fix.WithMergeBudget(context.Background(), b), repo, delivery)
+	if err != nil || got.State != fix.MergeWaiting || time.Since(start) > 5*time.Second {
+		t.Fatalf("got %+v err %v after %s, want waiting at the end of the budget and not after Wait", got, err, time.Since(start))
+	}
+}
