@@ -215,7 +215,7 @@ func Report(app string, s fix.Summary) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "fix-agent: %s: %d open findings, %d coding jobs, %d without a fix", app, s.Total, s.Attempts, len(s.Skipped))
 	if s.Resumed != nil {
-		fmt.Fprintf(&b, ", resumed the merge of %s: %s", s.Resumed.ID, mergeLine(s.ResumedMerge))
+		fmt.Fprintf(&b, ", resumed the merge of %s (%s): %s", s.Resumed.ID, s.ResumedDelivery.MergeRequest, mergeLine(s.ResumedMerge))
 	}
 	b.WriteString("\n")
 	if s.Delivered != nil {

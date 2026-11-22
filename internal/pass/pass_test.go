@@ -450,7 +450,7 @@ func TestRun_AFixingFindingWithAnOpenMergeRequestIsMergedByALaterPass(t *testing
 	if err != nil || res.Metadata["resumed_finding"] != "stuck" || res.Metadata["resumed_merge"] == "" {
 		t.Fatalf("res %+v err %v, want the resumed merge", res, err)
 	}
-	if out, _ := res.Output.(string); !strings.Contains(strings.SplitN(out, "\n", 2)[0], "resumed the merge of stuck") {
+	if out, _ := res.Output.(string); !strings.Contains(strings.SplitN(out, "\n", 2)[0], "resumed the merge of stuck (acme/portal!7)") {
 		t.Errorf("header does not show the resumed merge:\n%s", out)
 	}
 }
