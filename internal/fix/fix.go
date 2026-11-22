@@ -146,7 +146,7 @@ const (
 	// MergeDone means that the connector merged the merge request.
 	MergeDone MergeState = "merged"
 	// MergeWaiting means that the daemon granted no merge slot while the agent
-	// waited. The merge request stays open. The daemon frees the slot when the run ends with the merge request open, and it queues the slot again (gibson#1626). The next pass merges it.
+	// waited. The merge request stays open. After gibson#1626 merges, the daemon frees the slot when the run ends with the merge request open, and it queues the slot again. The next pass merges it.
 	MergeWaiting MergeState = "waiting"
 	// MergeNotAllowed means that the agent holds no merge grant. The merge
 	// request stays open for a person.
@@ -173,6 +173,10 @@ const (
 // Merge is the outcome of the merge step.
 type Merge struct {
 	State MergeState
+	// Called is true when the step sent the merge call to the daemon. A step
+	// that ended on the state of the merge request, or on a missing fact, sent
+	// no call.
+	Called bool
 	// Reason is one plain sentence. It is empty for MergeDone.
 	Reason string
 }
@@ -214,6 +218,9 @@ type Summary struct {
 	ResumedDelivery Delivery
 	// ResumedMerge is the outcome of the merge step for Resumed.
 	ResumedMerge Merge
+	// Passed lists the pending merges that ended with a final outcome and no
+	// merge call before Resumed. The pass went on to the next pending merge.
+	Passed []Resumption
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
 	// Deferred lists the Findings whose coding job failed, was canceled, or
@@ -223,6 +230,18 @@ type Summary struct {
 	// Attempts is the number of coding jobs that the pass started.
 	Attempts int
 }
+
+// Resumption is one pending merge that the pass tried.
+type Resumption struct {
+	Finding  Finding
+	Delivery Delivery
+	Merge    Merge
+}
+
+// counts says if a merge step is the one merge step of the pass. A step that
+// sent the merge call or waited for the slot is. A final outcome that sent no
+// call is not, and the pass goes on to the next merge request.
+func (m Merge) counts() bool { return m.Called || m.State == MergeWaiting }
 
 // Pass runs one pass over one Application.
 //
@@ -253,16 +272,20 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 	// can come after that run ended, so this pass merges the one of the
 	// highest priority. The pass makes at most one merge call.
 	merged := false
-	if p, ok := firstPending(pending); ok {
+	for _, p := range rankPending(pending) {
 		slog.Info("resume the merge of an open merge request", "finding", p.Finding.ID, "merge_request", p.Delivery.MergeRequest)
 		m, err := merger.Merge(ctx, repo, p.Delivery)
 		if err != nil {
 			return sum, fmt.Errorf("fix: merge the open merge request of finding %s: %w", p.Finding.ID, err)
 		}
-		slog.Info("merge step ended", "finding", p.Finding.ID, "state", m.State, "reason", m.Reason)
+		slog.Info("merge step ended", "finding", p.Finding.ID, "state", m.State, "reason", m.Reason, "called", m.Called)
 		f := p.Finding
 		sum.Resumed, sum.ResumedDelivery, sum.ResumedMerge = &f, p.Delivery, m
-		merged = true
+		if m.counts() {
+			merged = true
+			break
+		}
+		sum.Passed = append(sum.Passed, Resumption{Finding: f, Delivery: p.Delivery, Merge: m})
 	}
 
 	for _, f := range ranked {
@@ -295,7 +318,7 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		slog.Info("merge request opened", "finding", f.ID, "status", del.Status, "mission", del.MissionID)
 		sum.Delivered, sum.Delivery = &f, del
 		if merged {
-			// The pass made its one merge call for the resumed merge request.
+			// The pass made its one merge step for the resumed merge request.
 			// The next pass merges this one.
 			sum.Merge = Merge{State: MergeSkipped, Reason: "this pass already made a merge call for finding " + sum.Resumed.ID}
 			break
@@ -328,20 +351,20 @@ func onlyPending(in []Pending, id string) []Pending {
 	return nil
 }
 
-// firstPending returns the pending merge of the highest priority. Rank gives
-// the order, so two runs over the same graph choose the same one.
-func firstPending(in []Pending) (Pending, bool) {
-	if len(in) == 0 {
-		return Pending{}, false
-	}
+// rankPending returns the pending merges in the order of Rank, the highest
+// priority first.
+func rankPending(in []Pending) []Pending {
 	byID := make(map[string]Pending, len(in))
 	fs := make([]Finding, 0, len(in))
 	for _, p := range in {
 		byID[p.Finding.ID] = p
 		fs = append(fs, p.Finding)
 	}
-	p, ok := byID[Rank(fs)[0].ID]
-	return p, ok
+	out := make([]Pending, 0, len(in))
+	for _, f := range Rank(fs) {
+		out = append(out, byID[f.ID])
+	}
+	return out
 }
 
 func only1(in []Finding, id string) []Finding {

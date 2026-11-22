@@ -49,12 +49,18 @@ type fakeMerger struct {
 	state fix.MergeState
 	err   error
 	got   []fix.Delivery
+	// byMR answers by merge request key. Called is true unless noCall names the key.
+	byMR   map[string]fix.MergeState
+	noCall map[string]bool
 }
 
 func (m *fakeMerger) Merge(_ context.Context, _ fix.Repository, d fix.Delivery) (fix.Merge, error) {
 	m.got = append(m.got, d)
 	if m.err != nil {
 		return fix.Merge{}, m.err
+	}
+	if st, ok := m.byMR[d.MergeRequest]; ok {
+		return fix.Merge{State: st, Reason: "because", Called: !m.noCall[d.MergeRequest]}, nil
 	}
 	if m.state == "" {
 		return fix.Merge{State: fix.MergeDone}, nil
@@ -408,5 +414,46 @@ func TestPass_AFailedPendingReadFailsThePass(t *testing.T) {
 	_, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{pendingErr: boom}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the read error", err)
+	}
+}
+
+func TestPass_AFinalOutcomeWithNoCallGoesOnToTheNextPendingMerge(t *testing.T) {
+	m := &fakeMerger{
+		byMR:   map[string]fix.MergeState{"acme/portal!top": fix.MergeRefused, "acme/portal!mid": fix.MergeWaiting},
+		noCall: map[string]bool{"acme/portal!top": true},
+	}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("low", "P4"), pendingMR("mid", "P2"), pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 2 || m.got[0].MergeRequest != "acme/portal!top" || m.got[1].MergeRequest != "acme/portal!mid" {
+		t.Fatalf("merge calls %+v, want top then mid", m.got)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "mid" || len(sum.Passed) != 1 || sum.Passed[0].Finding.ID != "top" {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_AStepThatSentTheCallStopsThePendingMerges(t *testing.T) {
+	m := &fakeMerger{byMR: map[string]fix.MergeState{"acme/portal!top": fix.MergeRefused}}
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("mid", "P2"), pendingMR("top", "P1")}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 1 {
+		t.Fatalf("err %v merge calls %+v, want one", err, m.got)
+	}
+}
+
+func TestPass_WhenNoPendingMergeCountsTheNewMergeRequestIsMerged(t *testing.T) {
+	m := &fakeMerger{
+		byMR:   map[string]fix.MergeState{"acme/portal!top": fix.MergeDone},
+		noCall: map[string]bool{"acme/portal!top": true},
+	}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 2 || sum.Merge.State != fix.MergeDone {
+		t.Fatalf("err %v merge calls %+v merge %+v, want a merge step for the new merge request", err, m.got, sum.Merge)
 	}
 }

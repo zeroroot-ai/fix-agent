@@ -22,11 +22,11 @@
 // asks by calling the tool. A refusal with the code UNAVAILABLE ("merge not
 // granted yet" is one) means that the call can succeed later. The agent waits
 // and calls again until the Wait bound ends. One call has its own bound
-// (CallTimeout), and a call that hangs ends at it, inside the wait. An agent that stops waiting leaves the merge request open, and
-// a slot that the daemon grants after that is not used. It blocks the other
-// fixes of the Application until MergeSlotHold ends (24 hours). The daemon
-// must re-dispatch the agent on MergeGranted, or free the slot when the run
-// ends. That change is in gibson, see gibson#1609.
+// (CallTimeout), and a call that hangs ends at it, inside the wait. An agent
+// that stops waiting leaves the merge request open. After gibson#1626 merges,
+// the daemon frees the slot when the run ends with the merge request open, and
+// it queues the slot again. A later pass of the agent merges the merge request
+// with a new mission, and the daemon accepts that call.
 //
 // # The head and the files of the fix
 //
@@ -210,6 +210,7 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 		if jerr != nil {
 			return fix.Merge{}, jerr
 		}
+		res.Called = true
 		if !again {
 			return res, nil
 		}
@@ -293,6 +294,10 @@ func (m *Merger) head(ctx context.Context, repo fix.Repository, d fix.Delivery, 
 		return "", nil, false, jerr
 	}
 	switch {
+	case r.State == "merged" || r.Merged:
+		return "", &fix.Merge{State: fix.MergeDone}, false, nil
+	case r.State == "closed":
+		return "", &fix.Merge{State: fix.MergeRefused, Reason: hostReason(r.State, r.Reason)}, false, nil
 	case r.ChangedFilesError != "":
 		return "", &fix.Merge{
 			State:  fix.MergeForeignChange,

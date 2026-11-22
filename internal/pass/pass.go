@@ -218,6 +218,9 @@ func Report(app string, s fix.Summary) string {
 		fmt.Fprintf(&b, ", resumed the merge of %s (%s): %s", s.Resumed.ID, s.ResumedDelivery.MergeRequest, mergeLine(s.ResumedMerge))
 	}
 	b.WriteString("\n")
+	for _, r := range s.Passed {
+		fmt.Fprintf(&b, "  no merge step for %s (%s): %s\n", r.Finding.ID, r.Delivery.MergeRequest, mergeLine(r.Merge))
+	}
 	if s.Delivered != nil {
 		fmt.Fprintf(&b, "  merge request opened for %s: the daemon set the status %s (mission %s)",
 			s.Delivered.ID, s.Delivery.Status, s.Delivery.MissionID)
