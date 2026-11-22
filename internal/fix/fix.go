@@ -243,11 +243,10 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		del, err := coder.Fix(ctx, f, repo)
 		switch {
 		case errors.Is(err, ErrRetry):
-			// A job that ended with no merge request cannot get a block reason
-			// yet. The daemon does not fill fix_blocked_reason and the SDK does
-			// not return it, so the next pass would read the same finding again.
-			// When gibson#1579 ships, skip the finding with a reason here.
-			// See https://github.com/zeroroot-ai/gibson/issues/1579
+			// A job that ended with no merge request can be a temporary fault.
+			// The agent writes no block reason for it, because no actor clears
+			// a reason and the finding would stay skipped. The next pass tries
+			// the finding again.
 			slog.Warn("coding job gave no merge request yet, no reason written", "finding", f.ID, "error", err)
 			sum.Deferred = append(sum.Deferred, Skip{Finding: f, Reason: err.Error()})
 			continue
