@@ -506,7 +506,7 @@ func TestPass_WhenNoPendingMergeCountsTheNewMergeRequestIsMerged(t *testing.T) {
 // ctxMerger records if the context of each step carries a pending budget.
 type ctxMerger struct{ budget []bool }
 
-func (m *ctxMerger) Merge(ctx context.Context, _ fix.Repository, d fix.Delivery) (fix.Merge, error) {
+func (m *ctxMerger) Merge(ctx context.Context, _ fix.Repository, _ fix.Delivery) (fix.Merge, error) {
 	m.budget = append(m.budget, fix.MergeBudgetFrom(ctx) != nil)
 	return fix.Merge{State: fix.MergeRefused, Called: true}, nil
 }
