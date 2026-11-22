@@ -38,7 +38,7 @@ The daemon fills `fix_head_sha` and `fix_files` on the finding row from its own 
 
 Before the merge call, the agent also reads `merge_request_state`. It merges only when `changed_files` equals `fix_files` in path, change, previous path and blob sha. These cases are final refusals: a change of mode (`mode_changed`), a mode other than 100644, a list that the host cut (`changed_files_truncated`), a list that the host did not give (`changed_files_error`), and a head that differs from `fix_head_sha`. GitHub gives no mode, and an empty mode is not a refusal. A commit that a person pushes between the end of the job and the link is in both values, and the agent cannot see it.
 
-**Fail closed.** The daemon does not fill `fix_head_sha` yet (gibson wave 2). Until it does, the agent makes no merge call and no read, and the outcome is `skipped`. The merge request stays open for a person. The same applies when `fix_files` is empty.
+**Fail closed.** The daemon fills `fix_head_sha` and `fix_files` from its own read of the merge request (gibson#1619). When either is empty, the agent makes no merge call and no read, and the outcome is `skipped`. The merge request stays open for a person.
 
 The agent tells the refusals of the daemon apart by the code of `agent.ToolCallError`, never by its text. `UNAVAILABLE` means that the same call can succeed later (the slot is not granted, an approval is pending, a check of the daemon failed). `PERMISSION_DENIED` is final. Any other code is a refusal of the tool or the host. An error that is not a `ToolCallError` did not come from the daemon, and the run fails.
 
@@ -50,7 +50,7 @@ The agent tells the refusals of the daemon apart by the code of `agent.ToolCallE
 | Code `PERMISSION_DENIED` | `not_allowed` | Does not call again. The merge request stays open for a person. |
 | The head of the merge request differs from `fix_head_sha`, or the host refuses the head | `head_moved` | Does not call again. |
 | The files of the merge request are not `fix_files`, a mode change, a cut list or no list | `foreign_change` | Does not call again. |
-| The daemon filled no `fix_head_sha` or no `fix_files` | `skipped` | Makes no call. This is the case today. |
+| The daemon filled no `fix_head_sha` or no `fix_files` | `skipped` | Makes no call. |
 | The key of the merge request is empty | `skipped` | Makes no call. |
 | The connector gives no `head_sha` | `skipped` | Makes no merge call. |
 | The host refuses, for example the branch protection | `refused` | Does not call again. The finding stays `fixing`, and the daemon records the reason. |

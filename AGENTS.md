@@ -98,7 +98,7 @@ A dispatch with no `bank`, no `connector` or no `project` fails the run. The age
 
 The agent works for a scan finding, a finding from an attack proof and a finding from a tool of the buyer, because it reads only the fields that all three have. It does not judge how hard a change is. The coding agent and the pipeline judge that.
 
-The reason is the property `fix_blocked_reason` of the finding (`internal/emit`). It is written as a sighting with the identity property `brain_id`. The projector of the daemon stores this property, and the daemon returns it in the component read. The harness callback does not return it yet, so the agent cannot skip a finding that has a reason. See the open items in the README.
+The reason is the property `fix_blocked_reason` of the finding (`internal/emit`). It is written as a sighting with the identity property `brain_id`. The projector of the daemon stores this property, and the daemon returns it in the component read. The harness read returns it too (gibson#1603). The agent does not skip a finding by an old reason. It checks each finding again in each pass, because the facts of a finding can change and no actor clears a reason.
 
 ## Dispatch, not enrollment
 
