@@ -244,9 +244,9 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		switch {
 		case errors.Is(err, ErrRetry):
 			// A job that ended with no merge request can be a temporary fault.
-			// The agent writes no block reason for it, because no actor clears
-			// a reason and the finding would stay skipped. The next pass tries
-			// the finding again.
+			// A temporary fault is not a fact about the finding, so the agent
+			// writes no block reason for it. The next pass tries the finding
+			// again.
 			slog.Warn("coding job gave no merge request yet, no reason written", "finding", f.ID, "error", err)
 			sum.Deferred = append(sum.Deferred, Skip{Finding: f, Reason: err.Error()})
 			continue
