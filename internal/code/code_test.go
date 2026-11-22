@@ -44,6 +44,9 @@ type fakeHarness struct {
 	deliver bool
 	// mergeRequest is the key that the daemon returns for f-1 when it fills it.
 	mergeRequest string
+	// fixHead and fixFiles are the head and the files that the daemon records.
+	fixHead  string
+	fixFiles []agent.FixFile
 	// lag is the number of reads before the new status shows.
 	lag int
 
@@ -94,6 +97,7 @@ func (m *fakeHarness) ApplicationFindings(_ context.Context, app string, statuse
 			row := agent.ApplicationFinding{FindingID: id, Status: s}
 			if id == "f-1" && s == fix.StatusFixing {
 				row.MergeRequest = m.mergeRequest
+				row.FixHeadSHA, row.FixFiles = m.fixHead, m.fixFiles
 			}
 			out = append(out, row)
 		}
@@ -246,6 +250,27 @@ func TestFix_TheDeliveryCarriesTheKeyOfTheMergeRequest(t *testing.T) {
 	c, _ = code.New(m, fast)
 	if d, err = c.Fix(context.Background(), fnd, repo); err != nil || d.MergeRequest != "" {
 		t.Fatalf("delivery = %+v err %v, want an empty key when the daemon returns none", d, err)
+	}
+}
+
+func TestFix_TheDeliveryCarriesTheHeadAndTheFilesThatTheDaemonRecorded(t *testing.T) {
+	m := &fakeHarness{
+		result: completed(), deliver: true, mergeRequest: "acme/portal!7", fixHead: " h1 ",
+		fixFiles: []agent.FixFile{{Path: "b.go", Change: "renamed", PreviousPath: "a.go", BlobSHA: "blob-b"}},
+	}
+	c, err := code.New(m, fast)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d, err := c.Fix(context.Background(), fnd, repo)
+	if err != nil || d.HeadSHA != "h1" || len(d.Files) != 1 ||
+		d.Files[0] != (fix.File{Path: "b.go", Change: "renamed", PreviousPath: "a.go", BlobSHA: "blob-b"}) {
+		t.Fatalf("delivery = %+v err %v, want the head and the files of the row", d, err)
+	}
+	m = &fakeHarness{result: completed(), deliver: true, mergeRequest: "acme/portal!7"}
+	c, _ = code.New(m, fast)
+	if d, err = c.Fix(context.Background(), fnd, repo); err != nil || d.HeadSHA != "" || len(d.Files) != 0 {
+		t.Fatalf("delivery = %+v err %v, want an empty head and no files when the daemon fills none", d, err)
 	}
 }
 

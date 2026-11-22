@@ -36,15 +36,21 @@
 // tool argument expected_head_sha is in zeroroot-ai/connectors
 // feat/fixloop-open-merge-request. The tool in main has the argument sha.
 //
-// # Paths that the job did not change
+// # The head and the files of the fix
 //
-// The pin of the head does not stop a commit that was on the branch before the
-// coding job pushed. So the agent also compares changed_files of
-// merge_request_state with the set of paths that the coding job changed
-// (Delivery.ChangedFiles), and it does not merge unless the two sets are equal.
-// A mismatch is final. The agent does not guess the set. If the delivery has no
-// record of it, or the connector returns no changed_files, the agent does not
-// merge. No harness call returns the paths of the job yet, see AGENTS.md.
+// The daemon fills fix_head_sha and fix_files of the finding from its own read
+// of the fix merge request, when it links the finding to it. The agent never
+// takes them from the coding job, because a report of the job is a claim. The
+// agent sends fix_head_sha as expected_head_sha, so the host refuses a merge
+// when a person pushed a commit after the link. It also reads merge_request_state
+// and merges only when changed_files equals fix_files in path, change,
+// previous_path and blob_sha. It refuses a change of mode, a mode other than
+// 100644, a list that the host cut, and a list that the host did not give. Each
+// of these refusals is final. A commit that a person pushes between the end of
+// the job and the link is in both values, and the agent cannot see it.
+//
+// Until the daemon fills fix_head_sha the agent makes no merge call (fail
+// closed).
 //
 // # What it leaves to the daemon
 //
@@ -95,28 +101,6 @@ const MaxBackoff = 8
 // DefaultPoll is the time between two calls. The daemon reads the facts of the
 // fix loop on its own interval, so a faster call gives the same answer.
 const DefaultPoll = 15 * time.Second
-
-// The texts that the daemon puts in a refusal of invoke_tool. The SDK returns
-// a refusal as an error with the message of the daemon, so this is the one
-// place that reads them. Source: gibson internal/engine/metatool
-// (approval.go and metatool.go) and internal/engine/harness/callback_metatool.go.
-const (
-	// textNotGranted is in ErrMergeNotGranted.
-	textNotGranted = "merge not granted yet"
-	// textUnauthorized is in ErrUnauthorized, the failed can_execute check.
-	textUnauthorized = "not authorized to invoke tool"
-	// textBlocked is in ErrBlocked, a tool that the mission policy blocks.
-	textBlocked = "blocked by mission policy"
-	// textPending is in ErrApprovalPending.
-	textPending = "pending authorization"
-	// textAudit is in ErrAuditUnavailable.
-	textAudit = "audit record of the call could not be written"
-	// textMergeCheck is in the error of a failed MayMerge read.
-	textMergeCheck = "the merge check of"
-	// textTransport starts the error of the SDK when the call did not reach
-	// the daemon.
-	textTransport = "CallToolProto callback failed"
-)
 
 // Caller is the one harness call that this package needs. agent.Harness
 // satisfies it, and so does a fake.
@@ -174,11 +158,11 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 			Reason: "the daemon returned no key for the merge request, so the agent cannot name it to the merge tool",
 		}, nil
 	}
-	if len(d.ChangedFiles) == 0 {
+	if d.HeadSHA == "" || len(d.Files) == 0 {
 		return fix.Merge{
 			State: fix.MergeSkipped,
-			Reason: "the agent has no record of the paths that the coding job changed, " +
-				"so it cannot tell a foreign commit on the branch from the change of the job",
+			Reason: "the daemon has not filled the head and the files of the fix merge request, " +
+				"so the agent cannot tell a foreign commit on the branch from the change of the job",
 		}, nil
 	}
 	id, err := ToolID(repo.ConnectorRef)
@@ -282,67 +266,86 @@ func (m *Merger) head(ctx context.Context, repo fix.Repository, d fix.Delivery) 
 	if jerr != nil {
 		return "", nil, false, jerr
 	}
-	if r.HeadSHA == "" {
-		return "", &fix.Merge{
-			State:  fix.MergeSkipped,
-			Reason: "the connector returned no head_sha, so the agent cannot bind the merge to the head that it saw",
-		}, false, nil
-	}
-	if len(r.ChangedFiles) == 0 {
-		return "", &fix.Merge{
-			State:  fix.MergeSkipped,
-			Reason: "the connector returned no changed_files, so the agent cannot check the paths of the branch",
-		}, false, nil
-	}
-	if r.Truncated || r.TruncatedFiles {
+	switch {
+	case r.ChangedFilesError != "":
 		return "", &fix.Merge{
 			State:  fix.MergeForeignChange,
-			Reason: "the host gave only a part of the changed files, so the agent cannot compare them with the paths of the coding job",
+			Reason: "the host did not give the changed files: " + r.ChangedFilesError,
 		}, false, nil
-	}
-	if extra, missing := diff(paths(r.ChangedFiles), d.ChangedFiles); len(extra)+len(missing) > 0 {
+	case r.Truncated:
 		return "", &fix.Merge{
-			State: fix.MergeForeignChange,
-			Reason: "the paths of the merge request are not the paths that the coding job changed" +
-				listed(" (not from the job: ", extra) + listed(" (missing: ", missing),
+			State:  fix.MergeForeignChange,
+			Reason: "the host gave only a part of the changed files, so the agent cannot compare them with the files of the fix",
+		}, false, nil
+	case r.HeadSHA == "":
+		return "", &fix.Merge{
+			State:  fix.MergeSkipped,
+			Reason: "the connector returned no head_sha, so the agent cannot check the head of the merge request",
+		}, false, nil
+	case !strings.EqualFold(r.HeadSHA, d.HeadSHA):
+		return "", &fix.Merge{
+			State:  fix.MergeHeadMoved,
+			Reason: "the head of the merge request is " + r.HeadSHA + " and the daemon recorded " + d.HeadSHA + ", so the agent did not merge it",
 		}, false, nil
 	}
-	return r.HeadSHA, nil, false, nil
+	if problems := compare(r.ChangedFiles, d.Files); len(problems) > 0 {
+		return "", &fix.Merge{
+			State:  fix.MergeForeignChange,
+			Reason: "the files of the merge request are not the files of the fix: " + listed(problems),
+		}, false, nil
+	}
+	return d.HeadSHA, nil, false, nil
 }
 
-// diff returns the paths of got that are not in want, and the paths of want
-// that are not in got. Both are sorted.
-func diff(got, want []string) (extra, missing []string) {
-	g, w := map[string]bool{}, map[string]bool{}
-	for _, p := range got {
-		g[p] = true
+// regularMode is the only file mode that a fix may set.
+const regularMode = "100644"
+
+// compare returns what differs between the files that the host lists and the
+// files that the daemon recorded for the fix. It returns nothing when they are
+// equal in path, change, previous_path and blob_sha, and the host shows no mode
+// change and no mode other than the regular one.
+func compare(got []changedFile, want []fix.File) []string {
+	var out []string
+	w := make(map[string]fix.File, len(want))
+	for _, f := range want {
+		w[f.Path] = f
 	}
-	for _, p := range want {
-		w[p] = true
-	}
-	for p := range g {
-		if !w[p] {
-			extra = append(extra, p)
+	seen := map[string]bool{}
+	for _, g := range got {
+		seen[g.Path] = true
+		if g.Change == changeModeChanged {
+			out = append(out, g.Path+" changes the mode")
+			continue
+		}
+		if g.Mode != "" && g.Mode != regularMode && g.Change != "deleted" {
+			out = append(out, g.Path+" has the mode "+g.Mode)
+		}
+		f, ok := w[g.Path]
+		switch {
+		case !ok:
+			out = append(out, g.Path+" is not a file of the fix")
+		case f.Change != g.Change || f.PreviousPath != g.PreviousPath || !strings.EqualFold(f.BlobSHA, g.BlobSHA):
+			out = append(out, g.Path+" differs from the fix in change, previous path or content")
 		}
 	}
-	for p := range w {
-		if !g[p] {
-			missing = append(missing, p)
+	for _, f := range want {
+		if !seen[f.Path] {
+			out = append(out, f.Path+" is missing")
 		}
 	}
-	slices.Sort(extra)
-	slices.Sort(missing)
-	return extra, missing
+	slices.Sort(out)
+	return out
 }
 
-func listed(label string, paths []string) string {
-	if len(paths) == 0 {
-		return ""
+// changeModeChanged is a change of the file mode with no change of the content
+// (zeroroot-ai/connectors, internal/fixloop).
+const changeModeChanged = "mode_changed"
+
+func listed(items []string) string {
+	if len(items) > 5 {
+		items = append(items[:5:5], "...")
 	}
-	if len(paths) > 5 {
-		paths = append(paths[:5:5], "...")
-	}
-	return label + strings.Join(paths, ", ") + ")"
+	return strings.Join(items, "; ")
 }
 
 func request(id, mergeRequest, head string) (*structpb.Struct, error) {
@@ -356,25 +359,15 @@ func request(id, mergeRequest, head string) (*structpb.Struct, error) {
 	return in, nil
 }
 
-// changedFile is one entry of changed_files. The entry also holds change and
-// blob_sha. The agent reads them when the job record gives the blob ids of its
-// files.
+// changedFile is one entry of changed_files (zeroroot-ai/connectors,
+// internal/fixloop ChangedFile). The list holds no file content.
 type changedFile struct {
 	Path         string `json:"path"`
+	Change       string `json:"change"`
 	PreviousPath string `json:"previous_path"`
-}
-
-// paths returns the paths of the list. A renamed file counts under its new and
-// its old path, so a rename that the job did not make shows as a difference.
-func paths(files []changedFile) []string {
-	out := make([]string, 0, len(files))
-	for _, f := range files {
-		out = append(out, f.Path)
-		if f.PreviousPath != "" {
-			out = append(out, f.PreviousPath)
-		}
-	}
-	return out
+	BlobSHA      string `json:"blob_sha"`
+	// Mode is the file mode at the head. GitHub gives none, so it can be empty.
+	Mode string `json:"mode"`
 }
 
 // toolResult is the result object of a connector tool.
@@ -387,10 +380,10 @@ type toolResult struct {
 	// merge_request_state returns it in the connectors change that adds
 	// changed_files. The list holds no file content.
 	ChangedFiles []changedFile `json:"changed_files"`
-	// Truncated is true when the host gave only a part of the list. The two
-	// names are the two places that the contract can put the flag.
-	Truncated      bool `json:"truncated"`
-	TruncatedFiles bool `json:"changed_files_truncated"`
+	// Truncated is true when the merge request has more files than the list
+	// holds. ChangedFilesError is not empty when the host did not give the list.
+	Truncated         bool   `json:"changed_files_truncated"`
+	ChangedFilesError string `json:"changed_files_error"`
 }
 
 // result reads the result object of an invoke_tool answer. An answer with no
@@ -439,25 +432,28 @@ func judge(out *structpb.Struct, err error, head string) (m fix.Merge, again boo
 	return fix.Merge{State: fix.MergeWaiting, Reason: hostReason(r.State, r.Reason)}, true, nil
 }
 
-// refusal reads the error of a call.
+// refusal reads the error of a call by the code of the daemon (agent.ToolCallError).
+// An error that is not a ToolCallError did not come from the daemon. It is a
+// failure of the call, and the step returns it.
 func refusal(err error) (m fix.Merge, again bool, _ error) {
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, textTransport):
+	var tce *agent.ToolCallError
+	if !errors.As(err, &tce) {
 		return fix.Merge{}, false, fmt.Errorf("merge: %w", err)
-	case strings.Contains(msg, textNotGranted):
-		return fix.Merge{State: fix.MergeWaiting, Reason: "the daemon has not granted the merge slot"}, true, nil
-	case strings.Contains(msg, textPending), strings.Contains(msg, textAudit), strings.Contains(msg, textMergeCheck):
-		// These refusals pass with time. Call again inside the Wait bound.
-		return fix.Merge{State: fix.MergeWaiting, Reason: "the daemon could not allow the call now: " + msg}, true, nil
-	case strings.Contains(msg, textUnauthorized), strings.Contains(msg, textBlocked):
+	}
+	switch tce.Code {
+	case agent.ToolErrUnavailable:
+		// The daemon did not run the call now. The slot is not granted, an
+		// approval is pending, or a check of the daemon failed. Call again
+		// inside the Wait bound.
+		return fix.Merge{State: fix.MergeWaiting, Reason: "the daemon could not allow the call now: " + tce.Message}, true, nil
+	case agent.ToolErrPermissionDenied:
 		return fix.Merge{
 			State:  fix.MergeNotAllowed,
 			Reason: "the agent holds no grant to merge, so the merge request stays open for a person",
 		}, false, nil
 	}
 	// Any other refusal comes from the tool or the host. Do not call again.
-	return fix.Merge{State: fix.MergeRefused, Reason: "the merge tool refused the call: " + msg}, false, nil
+	return fix.Merge{State: fix.MergeRefused, Reason: "the merge tool refused the call: " + tce.Message}, false, nil
 }
 
 func hostReason(state, reason string) string {

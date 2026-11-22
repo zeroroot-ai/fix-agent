@@ -174,9 +174,14 @@ func (c *Coder) Fix(ctx context.Context, f fix.Finding, repo fix.Repository) (fi
 		return fix.Delivery{}, fmt.Errorf("mission %s: %w: the Finding was not fixing after %s",
 			info.ID, fix.ErrRetry, c.cfg.Settle)
 	}
-	return fix.Delivery{
+	d := fix.Delivery{
 		Status: row.Status, MissionID: info.ID, MergeRequest: strings.TrimSpace(row.MergeRequest),
-	}, nil
+		HeadSHA: strings.TrimSpace(row.FixHeadSHA),
+	}
+	for _, f := range row.FixFiles {
+		d.Files = append(d.Files, fix.File{Path: f.Path, Change: f.Change, PreviousPath: f.PreviousPath, BlobSHA: f.BlobSHA})
+	}
+	return d, nil
 }
 
 // settle reads the status of the Finding until the daemon shows that a merge

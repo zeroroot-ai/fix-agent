@@ -34,27 +34,29 @@ The agent merges its own fix on a green pipeline. No person acts. Three checks o
 
 The agent calls `invoke_tool` with the id `mcp:<connector>:merge_merge_request` and the argument `merge_request`. A refusal "merge not granted yet" means that the slot is not granted. The agent calls again until `merge_wait` ends (default 30 minutes). The wait between two calls starts at 15 seconds and doubles after every retry, up to 2 minutes. The same rule applies to the read of the merge request that comes before the merge call. When the wait ends, the merge request stays open. A slot that the daemon grants after that is not used, and it blocks the other fixes of the Application until `MergeSlotHold` ends (24 hours). The daemon must re-dispatch the agent on `MergeGranted`, or free the slot when the run ends. That change is in gibson (gibson#1609).
 
-Before the first merge call, the agent reads `head_sha` of the merge request with `merge_request_state`. It sends the value as `expected_head_sha`. The host refuses the merge when a person pushed a commit to the fix branch while the agent waited. The agent treats that refusal as final. The argument `expected_head_sha` is in `zeroroot-ai/connectors` on the branch `feat/fixloop-open-merge-request` and is not on `main` yet. If the connector returns no `head_sha`, the agent does not merge.
+The daemon fills `fix_head_sha` and `fix_files` on the finding row from its own read of the fix merge request, when it links the finding to it. The agent never takes them from the coding job, because a report of the job is a claim. The agent sends `fix_head_sha` as `expected_head_sha`, so the host refuses the merge when a person pushed a commit after the link. That refusal is final.
 
-The pin does not stop a commit that was on the branch before the coding job pushed. So the agent also reads `changed_files` of `merge_request_state`. It reads the list as `{path, change, previous_path, blob_sha}` entries. A renamed file counts under both paths. A truncated list is a refusal. It merges only when that set of paths equals the set that the coding job changed (`Delivery.ChangedFiles`). A mismatch is final (`foreign_change`). **The merge step does not merge today.** No harness call returns the paths that the coding job changed, so `Delivery.ChangedFiles` is empty and the outcome is `skipped`. The field `changed_files` is also not in `merge_request_state` yet. Both changes are listed in the open items.
+Before the merge call, the agent also reads `merge_request_state`. It merges only when `changed_files` equals `fix_files` in path, change, previous path and blob sha. These cases are final refusals: a change of mode (`mode_changed`), a mode other than 100644, a list that the host cut (`changed_files_truncated`), a list that the host did not give (`changed_files_error`), and a head that differs from `fix_head_sha`. GitHub gives no mode, and an empty mode is not a refusal. A commit that a person pushes between the end of the job and the link is in both values, and the agent cannot see it.
+
+**Fail closed.** The daemon does not fill `fix_head_sha` yet (gibson wave 2). Until it does, the agent makes no merge call and no read, and the outcome is `skipped`. The merge request stays open for a person. The same applies when `fix_files` is empty.
+
+The agent tells the refusals of the daemon apart by the code of `agent.ToolCallError`, never by its text. `UNAVAILABLE` means that the same call can succeed later (the slot is not granted, an approval is pending, a check of the daemon failed). `PERMISSION_DENIED` is final. Any other code is a refusal of the tool or the host. An error that is not a `ToolCallError` did not come from the daemon, and the run fails.
 
 | Answer | Outcome | What the agent does |
 |---|---|---|
 | The result has `merged: true` | `merged` | Ends the pass. |
-| Refusal "merge not granted yet" | `waiting` | Calls again until `merge_wait` ends. |
-| A refusal that passes with time (pending authorization, audit record, failed merge check), on the merge call or on the read | `waiting` | Calls again, with the wait that doubles, until `merge_wait` ends. |
-| The head of the merge request moved | `head_moved` | Does not call again. |
-| The connector gives no `head_sha` or no `changed_files` | `skipped` | Makes no merge call. |
-| The paths of the merge request are not the paths of the coding job | `foreign_change` | Does not call again. |
-| The agent has no record of the paths of the coding job | `skipped` | Makes no call. This is the case today. |
-| The answer has no result object | none | The run fails. The agent does not send the call again. |
+| Code `UNAVAILABLE`, on the merge call or on the read | `waiting` | Calls again, with the wait that doubles, until `merge_wait` ends. |
 | The host has not settled the merge status | `waiting` | Calls again until `merge_wait` ends. |
-| Refusal "not authorized to invoke tool" | `not_allowed` | Does not call again. The merge request stays open for a person. |
-| The host refuses, for example the branch protection | `refused` | Does not call again. The finding stays `fixing`, and the daemon records the reason. |
+| Code `PERMISSION_DENIED` | `not_allowed` | Does not call again. The merge request stays open for a person. |
+| The head of the merge request differs from `fix_head_sha`, or the host refuses the head | `head_moved` | Does not call again. |
+| The files of the merge request are not `fix_files`, a mode change, a cut list or no list | `foreign_change` | Does not call again. |
+| The daemon filled no `fix_head_sha` or no `fix_files` | `skipped` | Makes no call. This is the case today. |
 | The key of the merge request is empty | `skipped` | Makes no call. |
+| The connector gives no `head_sha` | `skipped` | Makes no merge call. |
+| The host refuses, for example the branch protection | `refused` | Does not call again. The finding stays `fixing`, and the daemon records the reason. |
+| Another code, for example `INVALID_ARGUMENT` | `refused` | Does not call again. |
+| The answer has no result object | none | The run fails. The agent does not send the call again. |
 | The call does not reach the daemon | none | The run fails. |
-
-The agent reads the refusal text of the daemon, because the SDK returns a refusal as an error with the message of the daemon. The text is in one place, `internal/merge`.
 
 The tool of both Git host connectors is `merge_merge_request`. See the docs of the host APIs that the tool calls:
 
@@ -70,7 +72,7 @@ Gibson sets seven variables when it launches the image. See [AGENTS.md](./AGENTS
 These items need a change in another repo.
 
 1. **Merge grant.** No harness call returns the merge slot. The agent asks by calling the merge tool, and the daemon refuses the call until it granted the slot. See [How the merge works](#how-the-merge-works). The agent names the merge request with the key that the harness read returns in `merge_request`. The daemon fills that key under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). Until then the merge step is skipped and the merge request stays open.
-2. **Paths of the coding job.** The agent must know which paths the coding job changed, and no harness call returns them. The driver of the job knows them from the deliverable. Until a harness field carries them, the merge step reports `skipped`. The connectors change that adds `changed_files` to `merge_request_state` is also open.
+2. **Head and files of the fix.** The daemon must fill `fix_head_sha` and `fix_files` on the finding row from its own read of the fix merge request (gibson wave 2). Until then the merge step reports `skipped`.
 3. **Revert.** The daemon reverts a failed fix with its own client. See gibson#1465.
 4. **The merge request ref.** The agent knows that a merge request exists from the status `fixing`. It reads that status, because the daemon caps a read at 500 rows. The SDK type `agent.ApplicationFinding` has the fields `MergeRequest` and `MergeRequestURL`. The agent reads the key from the row of the finding, and the daemon must fill it (see item 1). The agent does not read the mission output.
 5. **The reason property.** The projector stores `fix_blocked_reason`, and the component read of `ApplicationFinding` returns it (gibson#1556). The harness callback proto `ApplicationFinding` and the SDK type `agent.ApplicationFinding` have no field for it. Until both have it, the agent cannot skip a finding with a block reason. A job that ends with no merge request is deferred with no reason, and the next pass tries the same finding again. A finding that the agent cannot fix by a rule still gets a reason (`Unfixed`). Gibson fills `fix_blocked_reason` under [gibson#1579](https://github.com/zeroroot-ai/gibson/issues/1579). The SDK release that ships it comes after that.

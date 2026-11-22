@@ -40,9 +40,13 @@ type gate struct {
 	files     []any
 	noFiles   bool
 	truncated bool
+	// filesErr is changed_files_error of the state.
+	filesErr string
 	// readTransient is the refusal text for the first readTransientN reads.
 	readTransient  string
 	readTransientN int
+	// readCode is the code of that refusal. Empty means unavailable.
+	readCode string
 	// transient is the refusal text for the first transientN merge calls.
 	transient  string
 	transientN int
@@ -61,7 +65,7 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 	if id, _ := in.AsMap()["id"].(string); strings.HasSuffix(id, ":merge_request_state") {
 		g.reads++
 		if g.reads <= g.readTransientN {
-			return errors.New(g.readTransient)
+			return &agent.ToolCallError{Code: orUnavailable(g.readCode), Message: g.readTransient}
 		}
 		head := g.head
 		if head == "" {
@@ -77,8 +81,11 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 				files = []any{file("a.go", "modified"), file("b_test.go", "added")}
 			}
 			res["changed_files"] = files
+			if g.filesErr != "" {
+				res["changed_files_error"] = g.filesErr
+			}
 			if g.truncated {
-				res["truncated"] = true
+				res["changed_files_truncated"] = true
 			}
 		}
 		out, err := structpb.NewStruct(map[string]any{"result": res})
@@ -94,14 +101,14 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 		return nil
 	}
 	if g.calls <= g.transientN {
-		return errors.New(g.transient)
+		return &agent.ToolCallError{Code: agent.ToolErrUnavailable, Message: g.transient}
 	}
 	if !g.granted {
-		return errors.New("CallToolProto error: metatool: not authorized to invoke tool: " + in.AsMap()["id"].(string))
+		return denied("metatool: not authorized to invoke tool: " + in.AsMap()["id"].(string))
 	}
 	if g.calls < g.slotAfter {
-		return errors.New("CallToolProto error: metatool: merge not granted yet: the merge request waits for its merge slot: " +
-			"acme/portal!7. Do not retry now. Call again after the merge slot is granted.")
+		return &agent.ToolCallError{Code: agent.ToolErrUnavailable, Message: "metatool: merge not granted yet: " +
+			"the merge request waits for its merge slot: acme/portal!7. Do not retry now. Call again after the merge slot is granted."}
 	}
 	answer := g.hostAnswer
 	if answer == nil {
@@ -117,14 +124,29 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 
 // file is one entry of changed_files, in the shape of the connector.
 func file(path, change string) map[string]any {
-	return map[string]any{"path": path, "change": change, "blob_sha": "blob-" + path}
+	return map[string]any{"path": path, "change": change, "blob_sha": "blob-" + path, "mode": "100644"}
+}
+
+func denied(msg string) error {
+	return &agent.ToolCallError{Code: agent.ToolErrPermissionDenied, Message: msg}
+}
+
+func orUnavailable(code string) string {
+	if code == "" {
+		return agent.ToolErrUnavailable
+	}
+	return code
 }
 
 var (
 	repo     = fix.Repository{ConnectorRef: "connector/github-acme", Project: "acme/portal"}
 	delivery = fix.Delivery{
 		Status: fix.StatusFixing, MissionID: "mis-1", MergeRequest: "acme/portal#7",
-		ChangedFiles: []string{"b_test.go", "a.go"},
+		HeadSHA: "h1",
+		Files: []fix.File{
+			{Path: "a.go", Change: "modified", BlobSHA: "blob-a.go"},
+			{Path: "b_test.go", Change: "added", BlobSHA: "blob-b_test.go"},
+		},
 	}
 	fast = merge.Config{Wait: time.Minute, Poll: time.Millisecond}
 )
@@ -190,7 +212,7 @@ func TestMerge_ABlockedToolIsARefusalAndNotARetry(t *testing.T) {
 type blocked struct{ *gate }
 
 func (b blocked) CallToolProto(context.Context, string, protolib.Message, protolib.Message, ...agent.ToolCallOption) error {
-	return errors.New("CallToolProto error: metatool: the tool is blocked by mission policy: mcp:x:merge_merge_request")
+	return denied("metatool: the tool is blocked by mission policy: mcp:x:merge_merge_request")
 }
 
 func TestMerge_TheHostResultDecides(t *testing.T) {
@@ -227,7 +249,7 @@ func TestMerge_AnOpenMergeRequestThatTheHostHasNotSettledIsCalledAgain(t *testin
 
 func TestMerge_AnyOtherToolErrorIsARefusal(t *testing.T) {
 	g := &gate{granted: true, slotAfter: 1}
-	m, _ := merge.New(failing{errors.New("CallToolProto error: merge_request must be a pull request URL")}, fast)
+	m, _ := merge.New(failing{&agent.ToolCallError{Code: "ERROR_CODE_INVALID_ARGUMENT", Message: "merge_request must be a pull request URL"}}, fast)
 	got, err := m.Merge(context.Background(), repo, delivery)
 	if err != nil || got.State != fix.MergeRefused || !strings.Contains(got.Reason, "pull request URL") {
 		t.Fatalf("got %+v err %v (%d calls), want refused with the text of the tool", got, err, g.calls)
@@ -293,7 +315,9 @@ func TestNew_NoCaller(t *testing.T) {
 
 func TestMerge_SendsTheHeadThatItReadAsExpectedHeadSha(t *testing.T) {
 	g := &gate{granted: true, slotAfter: 1, head: "abc123"}
-	if got, err := run(t, g, fast, delivery); err != nil || got.State != fix.MergeDone {
+	d := delivery
+	d.HeadSHA = "abc123"
+	if got, err := run(t, g, fast, d); err != nil || got.State != fix.MergeDone {
 		t.Fatalf("got %+v err %v", got, err)
 	}
 	args, _ := g.got[0]["args"].(map[string]any)
@@ -315,6 +339,17 @@ func TestMerge_APushedCommitIsAFinalRefusal(t *testing.T) {
 	}
 }
 
+// A person pushed after the daemon linked the merge request. The state shows
+// another head than the one that the daemon recorded, so the agent does not ask
+// for the merge.
+func TestMerge_AHeadThatDiffersFromTheRecordedOneMeansNoMergeCall(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, head: "h2-pushed"}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeHeadMoved || g.calls != 0 || !strings.Contains(got.Reason, "h2-pushed") {
+		t.Fatalf("got %+v err %v after %d merge calls, want head_moved and no merge call", got, err, g.calls)
+	}
+}
+
 func TestMerge_NoHeadShaMeansNoMergeCall(t *testing.T) {
 	g := &gate{granted: true, slotAfter: 1, noHead: true}
 	got, err := run(t, g, fast, delivery)
@@ -324,7 +359,7 @@ func TestMerge_NoHeadShaMeansNoMergeCall(t *testing.T) {
 }
 
 func TestMerge_ARefusedStateReadIsAnOutcome(t *testing.T) {
-	m, _ := merge.New(failing{errors.New("CallToolProto error: metatool: not authorized to invoke tool: x")}, fast)
+	m, _ := merge.New(failing{denied("metatool: not authorized to invoke tool: x")}, fast)
 	got, err := m.Merge(context.Background(), repo, delivery)
 	if err != nil || got.State != fix.MergeNotAllowed {
 		t.Fatalf("got %+v err %v, want not_allowed", got, err)
@@ -400,37 +435,49 @@ func TestMerge_AMissingPathOfTheJobIsAFinalRefusal(t *testing.T) {
 	}
 }
 
-func TestMerge_NoRecordOfTheJobPathsMeansNoCall(t *testing.T) {
-	g := &gate{granted: true, slotAfter: 1}
-	d := delivery
-	d.ChangedFiles = nil
-	got, err := run(t, g, fast, d)
-	if err != nil || got.State != fix.MergeSkipped || g.calls != 0 || g.reads != 0 {
-		t.Fatalf("got %+v err %v calls %d reads %d, want skipped with no call", got, err, g.calls, g.reads)
+// Until the daemon fills the head and the files, the agent makes no call at all.
+func TestMerge_NoRecordFromTheDaemonMeansNoCall(t *testing.T) {
+	for name, mod := range map[string]func(*fix.Delivery){
+		"no head":  func(d *fix.Delivery) { d.HeadSHA = "" },
+		"no files": func(d *fix.Delivery) { d.Files = nil },
+		"neither":  func(d *fix.Delivery) { d.HeadSHA, d.Files = "", nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &gate{granted: true, slotAfter: 1}
+			d := delivery
+			mod(&d)
+			got, err := run(t, g, fast, d)
+			if err != nil || got.State != fix.MergeSkipped || g.calls != 0 || g.reads != 0 {
+				t.Fatalf("got %+v err %v calls %d reads %d, want skipped with no call", got, err, g.calls, g.reads)
+			}
+		})
 	}
 }
 
-func TestMerge_NoChangedFilesFromTheConnectorMeansNoMergeCall(t *testing.T) {
+func TestMerge_NoChangedFilesFromTheConnectorIsAFinalRefusal(t *testing.T) {
 	g := &gate{granted: true, slotAfter: 1, noFiles: true}
 	got, err := run(t, g, fast, delivery)
-	if err != nil || got.State != fix.MergeSkipped || g.calls != 0 {
-		t.Fatalf("got %+v err %v after %d merge calls, want skipped", got, err, g.calls)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
 	}
 }
 
-func TestMerge_ARenameThatTheJobDidNotMakeIsAFinalRefusal(t *testing.T) {
+func TestMerge_ARenameThatTheFixDidNotMakeIsAFinalRefusal(t *testing.T) {
 	renamed := file("b_test.go", "renamed")
 	renamed["previous_path"] = "internal/old_b_test.go"
 	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), renamed}}
 	got, err := run(t, g, fast, delivery)
-	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "internal/old_b_test.go") {
-		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change naming the old path", got, err, g.calls)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
 	}
 	d := delivery
-	d.ChangedFiles = []string{"a.go", "b_test.go", "internal/old_b_test.go"}
+	d.Files = []fix.File{
+		{Path: "a.go", Change: "modified", BlobSHA: "blob-a.go"},
+		{Path: "b_test.go", Change: "renamed", PreviousPath: "internal/old_b_test.go", BlobSHA: "blob-b_test.go"},
+	}
 	g = &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), renamed}}
 	if got, err = run(t, g, fast, d); err != nil || got.State != fix.MergeDone {
-		t.Fatalf("got %+v err %v, want merged when the job made the rename", got, err)
+		t.Fatalf("got %+v err %v, want merged when the fix made the rename", got, err)
 	}
 }
 
@@ -439,6 +486,64 @@ func TestMerge_ATruncatedListIsAFinalRefusal(t *testing.T) {
 	got, err := run(t, g, fast, delivery)
 	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "only a part") {
 		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
+	}
+}
+
+func TestMerge_AListThatTheHostDidNotGiveIsAFinalRefusal(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, filesErr: "the host refused the list"}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "refused the list") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
+	}
+}
+
+// The path set is the same and the content or the kind of change is not.
+func TestMerge_ADifferentBlobOrChangeIsAFinalRefusal(t *testing.T) {
+	blob := file("a.go", "modified")
+	blob["blob_sha"] = "blob-of-another-content"
+	for name, files := range map[string][]any{
+		"another blob":   {blob, file("b_test.go", "added")},
+		"another change": {file("a.go", "added"), file("b_test.go", "added")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &gate{granted: true, slotAfter: 1, files: files}
+			got, err := run(t, g, fast, delivery)
+			if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "a.go") {
+				t.Fatalf("got %+v err %v after %d merge calls, want foreign_change naming a.go", got, err, g.calls)
+			}
+		})
+	}
+}
+
+func TestMerge_AChangeOfModeIsAFinalRefusal(t *testing.T) {
+	exec := file("a.go", "modified")
+	exec["mode"] = "100755"
+	link := file("a.go", "modified")
+	link["mode"] = "120000"
+	onlyMode := file("c.sh", "mode_changed")
+	for name, files := range map[string][]any{
+		"an executable file":   {exec, file("b_test.go", "added")},
+		"a symbolic link":      {link, file("b_test.go", "added")},
+		"a change of the mode": {file("a.go", "modified"), file("b_test.go", "added"), onlyMode},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &gate{granted: true, slotAfter: 1, files: files}
+			got, err := run(t, g, fast, delivery)
+			if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 {
+				t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
+			}
+		})
+	}
+}
+
+// GitHub gives no mode in the list of files. An empty mode is not a refusal.
+func TestMerge_AnEmptyModeIsAccepted(t *testing.T) {
+	a, b := file("a.go", "modified"), file("b_test.go", "added")
+	delete(a, "mode")
+	delete(b, "mode")
+	g := &gate{granted: true, slotAfter: 1, files: []any{a, b}}
+	if got, err := run(t, g, fast, delivery); err != nil || got.State != fix.MergeDone {
+		t.Fatalf("got %+v err %v, want merged", got, err)
 	}
 }
 
@@ -453,9 +558,31 @@ func TestMerge_ATransientRefusalOfTheReadIsRetried(t *testing.T) {
 }
 
 func TestMerge_ARealRefusalOfTheReadIsFinal(t *testing.T) {
-	g := &gate{granted: true, slotAfter: 1, readTransient: "CallToolProto error: metatool: not authorized to invoke tool: x", readTransientN: 5}
+	g := &gate{granted: true, slotAfter: 1, readTransient: "metatool: not authorized to invoke tool: x", readCode: agent.ToolErrPermissionDenied, readTransientN: 5}
 	got, err := run(t, g, fast, delivery)
 	if err != nil || got.State != fix.MergeNotAllowed || g.reads != 1 || g.calls != 0 {
 		t.Fatalf("got %+v err %v after %d reads, want not_allowed after one read", got, err, g.reads)
+	}
+}
+
+// An error that is not a ToolCallError did not come from the daemon. It is
+// returned, whatever its text says.
+func TestMerge_AnErrorThatIsNotAToolCallErrorIsReturned(t *testing.T) {
+	for _, text := range []string{"connection refused", "merge not granted yet", "not authorized to invoke tool"} {
+		boom := errors.New(text)
+		_, err := run(t, &gate{granted: true, transport: boom}, fast, delivery)
+		if !errors.Is(err, boom) {
+			t.Errorf("%q: err = %v, want the error", text, err)
+		}
+	}
+}
+
+// The code decides and the words do not. The same words with another code do
+// not change the outcome.
+func TestMerge_TheCodeDecidesAndNotTheText(t *testing.T) {
+	m, _ := merge.New(failing{&agent.ToolCallError{Code: agent.ToolErrPermissionDenied, Message: "merge not granted yet"}}, fast)
+	got, err := m.Merge(context.Background(), repo, delivery)
+	if err != nil || got.State != fix.MergeNotAllowed {
+		t.Fatalf("got %+v err %v, want not_allowed", got, err)
 	}
 }

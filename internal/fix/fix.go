@@ -96,10 +96,21 @@ type Delivery struct {
 	// the Finding (the FIXED_BY edge). It is empty when the daemon did not
 	// return it. The key is the argument of the merge tool.
 	MergeRequest string
-	// ChangedFiles is the set of paths that the coding job changed, as the job
-	// recorded it. It is empty when no harness call returned it. The merge step
-	// does not merge without it.
-	ChangedFiles []string
+	// HeadSHA is the head commit of the fix merge request, and Files are the
+	// files that it changes. The daemon fills both from its own read of the
+	// merge request when it links the Finding (the fields FixHeadSHA and
+	// FixFiles of the finding row). They are empty when the daemon has not
+	// filled them. The merge step does not merge without them.
+	HeadSHA string
+	Files   []File
+}
+
+// File is one file that the fix merge request changes. It holds no content.
+type File struct {
+	Path         string
+	Change       string
+	PreviousPath string
+	BlobSHA      string
 }
 
 // Reader returns the open Findings of one Application.
