@@ -88,7 +88,8 @@ const ConnectorPrefix = "connector/"
 const DefaultWait = 30 * time.Minute
 
 // MaxBackoff bounds the wait between two calls to this factor of Poll. The wait
-// doubles after each call that ends in a refusal that can pass.
+// starts at Poll and doubles after every retry, up to this cap. It applies to
+// the read of the merge request and to the merge call alike.
 const MaxBackoff = 8
 
 // DefaultPoll is the time between two calls. The daemon reads the facts of the
@@ -184,16 +185,28 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 	if err != nil {
 		return fix.Merge{}, err
 	}
-	head, early, err := m.head(ctx, repo, d)
-	if err != nil || early != nil {
-		return derefMerge(early), err
+	w := &backoff{deadline: time.Now().Add(m.cfg.Wait), delay: m.cfg.Poll, max: m.cfg.Poll * MaxBackoff}
+	var head string
+	for {
+		h, early, again, herr := m.head(ctx, repo, d)
+		if herr != nil {
+			return fix.Merge{}, herr
+		}
+		if !again {
+			if early != nil {
+				return *early, nil
+			}
+			head = h
+			break
+		}
+		if ok, werr := w.next(ctx); werr != nil || !ok {
+			return derefMerge(early), werr
+		}
 	}
 	in, err := request(id, d.MergeRequest, head)
 	if err != nil {
 		return fix.Merge{}, err
 	}
-	deadline := time.Now().Add(m.cfg.Wait)
-	delay := m.cfg.Poll
 	for {
 		out := &structpb.Struct{}
 		cerr := m.c.CallToolProto(ctx, "invoke_tool", in, out)
@@ -204,19 +217,34 @@ func (m *Merger) Merge(ctx context.Context, repo fix.Repository, d fix.Delivery)
 		if !again {
 			return res, nil
 		}
-		if !time.Now().Add(delay).Before(deadline) {
-			return res, nil
+		if ok, werr := w.next(ctx); werr != nil || !ok {
+			return res, werr
 		}
-		t := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return fix.Merge{}, fmt.Errorf("merge: wait for the merge slot: %w", ctx.Err())
-		case <-t.C:
-		}
-		// A refusal that passes with time can last, so the wait grows.
-		delay = min(delay*2, m.cfg.Poll*MaxBackoff)
 	}
+}
+
+// backoff is the wait between two tries. It grows after every retry, up to max,
+// and it ends at the deadline.
+type backoff struct {
+	deadline   time.Time
+	delay, max time.Duration
+}
+
+// next waits for the next try. It returns false when no time is left before the
+// deadline, and an error when the context ends.
+func (b *backoff) next(ctx context.Context) (bool, error) {
+	if !time.Now().Add(b.delay).Before(b.deadline) {
+		return false, nil
+	}
+	t := time.NewTimer(b.delay)
+	select {
+	case <-ctx.Done():
+		t.Stop()
+		return false, fmt.Errorf("merge: wait for the merge slot: %w", ctx.Err())
+	case <-t.C:
+	}
+	b.delay = min(b.delay*2, b.max)
+	return true, nil
 }
 
 func derefMerge(m *fix.Merge) fix.Merge {
@@ -229,51 +257,57 @@ func derefMerge(m *fix.Merge) fix.Merge {
 // head reads head_sha of the merge request. It returns an outcome and no head
 // when the agent must not ask for the merge: the connector gave no head_sha, or
 // the read was refused.
-func (m *Merger) head(ctx context.Context, repo fix.Repository, d fix.Delivery) (string, *fix.Merge, error) {
+func (m *Merger) head(ctx context.Context, repo fix.Repository, d fix.Delivery) (head string, early *fix.Merge, again bool, _ error) {
 	key := d.MergeRequest
 	id, err := toolID(repo.ConnectorRef, ToolState)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	in, err := structpb.NewStruct(map[string]any{"id": id, "args": map[string]any{"merge_request": key}})
 	if err != nil {
-		return "", nil, fmt.Errorf("merge: build the request: %w", err)
+		return "", nil, false, fmt.Errorf("merge: build the request: %w", err)
 	}
 	out := &structpb.Struct{}
 	if cerr := m.c.CallToolProto(ctx, "invoke_tool", in, out); cerr != nil {
-		res, _, rerr := refusal(cerr)
+		res, retry, rerr := refusal(cerr)
 		if rerr != nil {
-			return "", nil, rerr
+			return "", nil, false, rerr
 		}
-		if res.State == fix.MergeWaiting {
-			res = fix.Merge{State: fix.MergeRefused, Reason: "the read of the merge request failed: " + cerr.Error()}
+		if res.State == fix.MergeRefused {
+			res.Reason = "the read of the merge request failed: " + cerr.Error()
 		}
-		return "", &res, nil
+		return "", &res, retry, nil
 	}
 	r, jerr := result(out)
 	if jerr != nil {
-		return "", nil, jerr
+		return "", nil, false, jerr
 	}
 	if r.HeadSHA == "" {
 		return "", &fix.Merge{
 			State:  fix.MergeSkipped,
 			Reason: "the connector returned no head_sha, so the agent cannot bind the merge to the head that it saw",
-		}, nil
+		}, false, nil
 	}
 	if len(r.ChangedFiles) == 0 {
 		return "", &fix.Merge{
 			State:  fix.MergeSkipped,
 			Reason: "the connector returned no changed_files, so the agent cannot check the paths of the branch",
-		}, nil
+		}, false, nil
 	}
-	if extra, missing := diff(r.ChangedFiles, d.ChangedFiles); len(extra)+len(missing) > 0 {
+	if r.Truncated || r.TruncatedFiles {
+		return "", &fix.Merge{
+			State:  fix.MergeForeignChange,
+			Reason: "the host gave only a part of the changed files, so the agent cannot compare them with the paths of the coding job",
+		}, false, nil
+	}
+	if extra, missing := diff(paths(r.ChangedFiles), d.ChangedFiles); len(extra)+len(missing) > 0 {
 		return "", &fix.Merge{
 			State: fix.MergeForeignChange,
 			Reason: "the paths of the merge request are not the paths that the coding job changed" +
 				listed(" (not from the job: ", extra) + listed(" (missing: ", missing),
-		}, nil
+		}, false, nil
 	}
-	return r.HeadSHA, nil, nil
+	return r.HeadSHA, nil, false, nil
 }
 
 // diff returns the paths of got that are not in want, and the paths of want
@@ -322,16 +356,42 @@ func request(id, mergeRequest, head string) (*structpb.Struct, error) {
 	return in, nil
 }
 
+// changedFile is one entry of changed_files.
+type changedFile struct {
+	Path string `json:"path"`
+	// Change is added, modified, deleted or renamed.
+	Change       string `json:"change"`
+	PreviousPath string `json:"previous_path"`
+	BlobSHA      string `json:"blob_sha"`
+}
+
+// paths returns the paths of the list. A renamed file counts under its new and
+// its old path, so a rename that the job did not make shows as a difference.
+func paths(files []changedFile) []string {
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		out = append(out, f.Path)
+		if f.PreviousPath != "" {
+			out = append(out, f.PreviousPath)
+		}
+	}
+	return out
+}
+
 // toolResult is the result object of a connector tool.
 type toolResult struct {
 	Merged  bool   `json:"merged"`
 	State   string `json:"state"`
 	Reason  string `json:"reason"`
 	HeadSHA string `json:"head_sha"`
-	// ChangedFiles is the set of paths that the merge request changes. The tool
+	// ChangedFiles lists the files that the merge request changes. The tool
 	// merge_request_state returns it in the connectors change that adds
-	// changed_files.
-	ChangedFiles []string `json:"changed_files"`
+	// changed_files. The list holds no file content.
+	ChangedFiles []changedFile `json:"changed_files"`
+	// Truncated is true when the host gave only a part of the list. The two
+	// names are the two places that the contract can put the flag.
+	Truncated      bool `json:"truncated"`
+	TruncatedFiles bool `json:"changed_files_truncated"`
 }
 
 // result reads the result object of an invoke_tool answer. An answer with no

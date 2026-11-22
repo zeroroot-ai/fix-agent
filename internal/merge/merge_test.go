@@ -37,8 +37,12 @@ type gate struct {
 	noHead bool
 	// files is changed_files of the state. Nil means the two paths of the job.
 	// noFiles leaves the key out.
-	files   []any
-	noFiles bool
+	files     []any
+	noFiles   bool
+	truncated bool
+	// readTransient is the refusal text for the first readTransientN reads.
+	readTransient  string
+	readTransientN int
 	// transient is the refusal text for the first transientN merge calls.
 	transient  string
 	transientN int
@@ -56,6 +60,9 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 	}
 	if id, _ := in.AsMap()["id"].(string); strings.HasSuffix(id, ":merge_request_state") {
 		g.reads++
+		if g.reads <= g.readTransientN {
+			return errors.New(g.readTransient)
+		}
 		head := g.head
 		if head == "" {
 			head = "h1"
@@ -67,9 +74,12 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 		if !g.noFiles {
 			files := g.files
 			if files == nil {
-				files = []any{"a.go", "b_test.go"}
+				files = []any{file("a.go", "modified"), file("b_test.go", "added")}
 			}
 			res["changed_files"] = files
+			if g.truncated {
+				res["truncated"] = true
+			}
 		}
 		out, err := structpb.NewStruct(map[string]any{"result": res})
 		if err != nil {
@@ -103,6 +113,11 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 	}
 	protolib.Merge(resp, out)
 	return nil
+}
+
+// file is one entry of changed_files, in the shape of the connector.
+func file(path, change string) map[string]any {
+	return map[string]any{"path": path, "change": change, "blob_sha": "blob-" + path}
 }
 
 var (
@@ -367,7 +382,7 @@ func TestMerge_AnAnswerWithNoResultObjectIsAnErrorAndIsNotResent(t *testing.T) {
 // pin passes, because the agent reads the head after that commit. The set of
 // paths does not equal the set of the job, so the agent does not merge.
 func TestMerge_ABranchWithAForeignCommitIsAFinalRefusal(t *testing.T) {
-	g := &gate{granted: true, slotAfter: 1, files: []any{"a.go", "b_test.go", "deploy/secrets.yaml"}}
+	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), file("b_test.go", "added"), file("deploy/secrets.yaml", "modified")}}
 	got, err := run(t, g, fast, delivery)
 	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 {
 		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change and no merge call", got, err, g.calls)
@@ -378,7 +393,7 @@ func TestMerge_ABranchWithAForeignCommitIsAFinalRefusal(t *testing.T) {
 }
 
 func TestMerge_AMissingPathOfTheJobIsAFinalRefusal(t *testing.T) {
-	g := &gate{granted: true, slotAfter: 1, files: []any{"a.go"}}
+	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified")}}
 	got, err := run(t, g, fast, delivery)
 	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "b_test.go") {
 		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change naming b_test.go", got, err, g.calls)
@@ -400,5 +415,47 @@ func TestMerge_NoChangedFilesFromTheConnectorMeansNoMergeCall(t *testing.T) {
 	got, err := run(t, g, fast, delivery)
 	if err != nil || got.State != fix.MergeSkipped || g.calls != 0 {
 		t.Fatalf("got %+v err %v after %d merge calls, want skipped", got, err, g.calls)
+	}
+}
+
+func TestMerge_ARenameThatTheJobDidNotMakeIsAFinalRefusal(t *testing.T) {
+	renamed := file("b_test.go", "renamed")
+	renamed["previous_path"] = "internal/old_b_test.go"
+	g := &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), renamed}}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "internal/old_b_test.go") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change naming the old path", got, err, g.calls)
+	}
+	d := delivery
+	d.ChangedFiles = []string{"a.go", "b_test.go", "internal/old_b_test.go"}
+	g = &gate{granted: true, slotAfter: 1, files: []any{file("a.go", "modified"), renamed}}
+	if got, err = run(t, g, fast, d); err != nil || got.State != fix.MergeDone {
+		t.Fatalf("got %+v err %v, want merged when the job made the rename", got, err)
+	}
+}
+
+func TestMerge_ATruncatedListIsAFinalRefusal(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, truncated: true}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeForeignChange || g.calls != 0 || !strings.Contains(got.Reason, "only a part") {
+		t.Fatalf("got %+v err %v after %d merge calls, want foreign_change", got, err, g.calls)
+	}
+}
+
+// A refusal of the read of the merge request that passes with time is retried
+// inside the wait, as the merge call is.
+func TestMerge_ATransientRefusalOfTheReadIsRetried(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, readTransient: "CallToolProto error: the audit record of the call could not be written", readTransientN: 2}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeDone || g.reads != 3 {
+		t.Fatalf("got %+v err %v after %d reads, want merged after three reads", got, err, g.reads)
+	}
+}
+
+func TestMerge_ARealRefusalOfTheReadIsFinal(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, readTransient: "CallToolProto error: metatool: not authorized to invoke tool: x", readTransientN: 5}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeNotAllowed || g.reads != 1 || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d reads, want not_allowed after one read", got, err, g.reads)
 	}
 }
