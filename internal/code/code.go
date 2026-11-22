@@ -29,9 +29,10 @@
 //
 // # What this package does not do
 //
-// It does not merge, and it does not revert. It also does not read the state
-// of the merge request. The daemon reads each of those facts itself through
-// the connector, so no fact that this agent states reaches a decision.
+// It does not merge, and it does not revert. The merge is in package merge.
+// This package also does not read the state of the merge request. The daemon
+// reads each of those facts itself through the connector, so no fact that
+// this agent states reaches a decision.
 package code
 
 import (
@@ -165,53 +166,60 @@ func (c *Coder) Fix(ctx context.Context, f fix.Finding, repo fix.Repository) (fi
 	if res.Status != mission.MissionStatusCompleted {
 		return fix.Delivery{}, fmt.Errorf("mission %s ended as %s: %w%s", info.ID, res.Status, fix.ErrRetry, suffix(res.Error))
 	}
-	status, err := c.settle(ctx, f.ID)
+	row, err := c.settle(ctx, f.ID)
 	if err != nil {
 		return fix.Delivery{}, fmt.Errorf("code: mission %s: %w", info.ID, err)
 	}
-	if status == "" {
+	if row == nil {
 		return fix.Delivery{}, fmt.Errorf("mission %s: %w: the Finding was not fixing after %s",
 			info.ID, fix.ErrRetry, c.cfg.Settle)
 	}
-	return fix.Delivery{Status: status, MissionID: info.ID}, nil
+	d := fix.Delivery{
+		Status: row.Status, MissionID: info.ID, MergeRequest: strings.TrimSpace(row.MergeRequest),
+		HeadSHA: strings.TrimSpace(row.FixHeadSHA),
+	}
+	for _, f := range row.FixFiles {
+		d.Files = append(d.Files, fix.File{Path: f.Path, Change: f.Change, PreviousPath: f.PreviousPath, BlobSHA: f.BlobSHA})
+	}
+	return d, nil
 }
 
 // settle reads the status of the Finding until the daemon shows that a merge
-// request exists, or until the Settle bound ends. It returns the status, or
-// "" when the bound ended first.
-func (c *Coder) settle(ctx context.Context, id string) (string, error) {
+// request exists, or until the Settle bound ends. It returns the row of the
+// Finding, or nil when the bound ended first.
+func (c *Coder) settle(ctx context.Context, id string) (*agent.ApplicationFinding, error) {
 	deadline := time.Now().Add(c.cfg.Settle)
 	for {
-		status, err := c.statusAfterJob(ctx, id)
-		if err != nil || status != "" {
-			return status, err
+		row, err := c.statusAfterJob(ctx, id)
+		if err != nil || row != nil {
+			return row, err
 		}
 		if !time.Now().Before(deadline) {
-			return "", nil
+			return nil, nil
 		}
 		t := time.NewTimer(c.cfg.Poll)
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return "", fmt.Errorf("wait for the status of finding %s: %w", id, ctx.Err())
+			return nil, fmt.Errorf("wait for the status of finding %s: %w", id, ctx.Err())
 		case <-t.C:
 		}
 	}
 }
 
 // statusAfterJob reads the Finding among the fixing Findings of the
-// Application. It returns "" when the Finding is not one of them.
-func (c *Coder) statusAfterJob(ctx context.Context, id string) (string, error) {
+// Application. It returns nil when the Finding is not one of them.
+func (c *Coder) statusAfterJob(ctx context.Context, id string) (*agent.ApplicationFinding, error) {
 	rows, err := c.h.ApplicationFindings(ctx, c.cfg.Application, afterJob, 0)
 	if err != nil {
-		return "", fmt.Errorf("read the status of finding %s: %w", id, err)
+		return nil, fmt.Errorf("read the status of finding %s: %w", id, err)
 	}
-	for _, r := range rows {
-		if strings.TrimSpace(r.FindingID) == id && slices.Contains(afterJob, r.Status) {
-			return r.Status, nil
+	for i := range rows {
+		if strings.TrimSpace(rows[i].FindingID) == id && slices.Contains(afterJob, rows[i].Status) {
+			return &rows[i], nil
 		}
 	}
-	return "", nil
+	return nil, nil
 }
 
 func suffix(s string) string {

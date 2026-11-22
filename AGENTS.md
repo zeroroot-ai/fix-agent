@@ -12,7 +12,8 @@ One dispatch is one pass over one Application. The agent does these steps in ord
 2. Order them by the priority that `cve-triage` wrote: P1 first, then P2, P3 and P4. A finding with no priority comes last (`internal/fix`, `Rank`).
 3. Decide for each finding if the agent can fix it (`internal/fix`, `Decide`).
 4. Send the first fixable finding to the coding path and get one merge request (`internal/code`).
-5. Write a reason on each finding that it cannot fix, and go on to the next finding (`internal/emit`). A coding mission that did not complete gets no reason. The next pass tries that finding again.
+5. Call the merge tool of the connector for the merge request, and wait for the merge slot (`internal/merge`).
+6. Write a reason on each finding that it cannot fix, and go on to the next finding (`internal/emit`). A coding mission that did not complete gets no reason. The next pass tries that finding again.
 
 The pass starts at most three coding jobs (`fix.MaxAttempts`). One dispatch gives at most one merge request.
 
@@ -50,23 +51,24 @@ The agent does not read the mission output. The callback `WaitForMission` of the
 
 ## What the agent never does
 
-- It never states that a fix worked. The agent ends when a merge request exists. The daemon reads the merge state, the deploy and the health signal through the connector of the tenant. The daemon sets `fixed`, `verified` or the revert.
+- It never states that a fix worked. The agent ends after the merge step. The daemon reads the merge state, the deploy and the health signal through the connector of the tenant. The daemon sets `fixed`, `verified` or the revert.
 - It never writes the status of a finding.
-- It never calls a connector tool of the Git host (see the next section).
+- It never calls a connector tool of the Git host except `merge_request_state` (a read) and `merge_merge_request`, and only through `invoke_tool` (see the next section).
+- It never calls `revert_merge_request`. Only the daemon reverts.
 
-## Seams that are not built: merge and revert
+## Merge, and the revert that is not here
 
-These two steps are part of the design of the fix loop (gibson#1454). The agent is built up to them and no further, because the daemon does not offer the read that each one needs.
+**Merge (gibson#1458).** The agent calls `invoke_tool` with the id `mcp:<connector>:merge_merge_request` and the argument `merge_request`. The key comes from the field `MergeRequest` of the finding row that the harness returns. The daemon gates the call (`internal/engine/metatool/approval.go` on `origin/main` of `gibson`):
 
-**Merge (gibson#1458).** The agent must call `mcp:<connector>:merge_merge_request` only after the daemon granted the merge. The daemon emits `MergeGranted` (`internal/engine/brain/mergegate.go` on `epic/fix-loop`). Today no agent can read it:
+- The `can_execute` check of the grant. A caller with no merge grant gets a refusal, and the agent leaves the merge request open.
+- The role `merge` of the tool. The daemon runs the call only when `World.MayMerge` finds a slot that `MergeGranted` granted. The slot binds the fix mission, and the parent mission may merge with it. The agent runs in the parent mission.
+- The refusal "merge not granted yet" is the only signal of the slot that an agent gets. The agent calls again until `merge_wait` ends.
 
-- No SDK method and no callback RPC returns the slot of a merge request.
-- Nothing in the code of the daemon emits `MergeRequestQueued`.
-- The check of `World.MayMerge` in `internal/engine/metatool` does not exist. Without it, `invoke_tool` would merge for any caller.
+Before the call, the agent reads `merge_request_state`. It sends `fix_head_sha` of the finding as `expected_head_sha`. It merges only when `changed_files` equals `fix_files` of the finding in path, change, previous path and blob sha, and it refuses a mode change, a mode other than 100644, a cut list and a list that the host did not give. The daemon fills `fix_head_sha` and `fix_files` from its own read of the merge request. The agent never takes them from the coding job. Until the daemon fills them, the agent makes no merge call.
 
-So the agent does not call `merge_merge_request`. When these exist, add one package that calls `invoke_tool` with the id `mcp:<connector>:merge_merge_request` and the argument `merge_request`, and call it at the end of `fix.Pass`.
+`internal/merge` holds this step. It reads the refusals of the daemon by the code of `agent.ToolCallError` (`errors.As`), never by their text.
 
-**Revert (gibson#1465).** The daemon calls `revert_merge_request` itself, with its own client, after a failed health signal that it read. No message from the daemon asks the agent to revert. So the agent has no revert code. If the owner of the grants moves the revert to the agent, the daemon must send a revert request to the agent first, and the agent calls the tool only on that request.
+**Revert (gibson#1465).** The daemon calls `revert_merge_request` itself, with its own client, after a failed health signal that it read. The tool has the role `daemon`, so a call by an agent is refused. The agent has no revert code, and it must get none.
 
 ## Task context
 
@@ -83,6 +85,7 @@ The mission node that dispatches the agent sets these keys of the task context.
 | `finding` | no | One finding to fix. The default is the highest priority. |
 | `target` | no | The target of the coding mission. |
 | `timeout` | no | The wait for the coding job, as a Go duration. The default is 45 minutes. |
+| `merge_wait` | no | The wait for the merge slot, as a Go duration. The default is 30 minutes. |
 
 A dispatch with no `bank`, no `connector` or no `project` fails the run. The agent writes no reason, because a fault of the dispatch is not a fact about a finding.
 
