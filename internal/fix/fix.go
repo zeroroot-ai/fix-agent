@@ -309,7 +309,7 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 
 	// A merge request that an earlier pass opened can still be open. The slot
 	// can come after that run ended, so this pass merges the one of the
-	// highest priority. The pass makes at most one merge call.
+	// highest priority. The pass makes at most one merge step that waits or merges.
 	merged := false
 	budget := &MergeBudget{}
 	pctx := WithMergeBudget(ctx, budget)
@@ -365,7 +365,7 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		if merged {
 			// The pass made its one merge step for the resumed merge request.
 			// The next pass merges this one.
-			sum.Merge = Merge{State: MergeSkipped, Reason: "this pass already made a merge call for finding " + sum.Resumed.ID}
+			sum.Merge = Merge{State: MergeSkipped, Reason: "this pass already made a merge step for finding " + sum.Resumed.ID}
 			break
 		}
 		m, err := merger.Merge(ctx, repo, del)

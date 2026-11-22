@@ -502,3 +502,21 @@ func TestPass_WhenNoPendingMergeCountsTheNewMergeRequestIsMerged(t *testing.T) {
 		t.Fatalf("err %v merge calls %+v merge %+v, want a merge step for the new merge request", err, m.got, sum.Merge)
 	}
 }
+
+// ctxMerger records if the context of each step carries a pending budget.
+type ctxMerger struct{ budget []bool }
+
+func (m *ctxMerger) Merge(ctx context.Context, _ fix.Repository, d fix.Delivery) (fix.Merge, error) {
+	m.budget = append(m.budget, fix.MergeBudgetFrom(ctx) != nil)
+	return fix.Merge{State: fix.MergeRefused, Called: true}, nil
+}
+
+func TestPass_TheMergeOfTheNewDeliveryGetsNoPendingBudget(t *testing.T) {
+	m := &ctxMerger{}
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.budget) != 2 || !m.budget[0] || m.budget[1] {
+		t.Fatalf("err %v budgets %v, want the pending step with a budget and the new delivery without", err, m.budget)
+	}
+}
