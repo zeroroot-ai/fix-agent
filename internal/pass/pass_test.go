@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -142,11 +143,18 @@ func openFindings() []agent.ApplicationFinding {
 	}
 }
 
+// answer is the reply of invoke_tool with the given result of the tool.
+func answer(result map[string]any) (*structpb.Struct, error) {
+	out, err := structpb.NewStruct(map[string]any{"result": result})
+	if err != nil {
+		return nil, fmt.Errorf("build the answer: %w", err)
+	}
+	return out, nil
+}
+
 // mergedAnswer is the result of the merge tool of a connector.
 func mergedAnswer(_ int, _ *structpb.Struct) (*structpb.Struct, error) {
-	return structpb.NewStruct(map[string]any{"result": map[string]any{
-		"merge_request": "acme/portal!7", "state": "merged", "merged": true,
-	}})
+	return answer(map[string]any{"merge_request": "acme/portal!7", "state": "merged", "merged": true})
 }
 
 func completed() *mission.MissionResult {
@@ -233,10 +241,10 @@ func TestRun_AnAgentWithNoMergeGrantDoesNotMerge(t *testing.T) {
 func TestRun_ARefusalOfTheGitHostLeavesTheMergeRequestOpen(t *testing.T) {
 	p := &fakePlatform{findings: openFindings(), result: completed(), deliver: true}
 	p.merge = func(int, *structpb.Struct) (*structpb.Struct, error) {
-		return structpb.NewStruct(map[string]any{"result": map[string]any{
+		return answer(map[string]any{
 			"state": "refused", "merged": false,
 			"reason": "GitHub does not allow the merge: a review is required",
-		}})
+		})
 	}
 	res, err := pass.Run(context.Background(), p, task(fullContext()))
 	if err != nil || res.Metadata["merge"] != "refused" || len(p.calls) != 1 {

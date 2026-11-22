@@ -6,6 +6,7 @@ package merge_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 	}
 	out, err := structpb.NewStruct(map[string]any{"result": answer})
 	if err != nil {
-		return err
+		return fmt.Errorf("build the answer: %w", err)
 	}
 	protolib.Merge(resp, out)
 	return nil
@@ -71,7 +72,11 @@ func run(t *testing.T, g *gate, cfg merge.Config, d fix.Delivery) (fix.Merge, er
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return m.Merge(context.Background(), repo, d)
+	got, err := m.Merge(context.Background(), repo, d)
+	if err != nil {
+		return got, fmt.Errorf("merge: %w", err)
+	}
+	return got, nil
 }
 
 func TestMerge_MergesWhenTheSlotIsGrantedAndNeedsNoPerson(t *testing.T) {
@@ -201,13 +206,13 @@ func TestMerge_ACanceledContextStopsTheWait(t *testing.T) {
 }
 
 func TestToolID(t *testing.T) {
-	for ref, want := range map[string]string{
-		"connector/gitlab-acme": "mcp:gitlab-acme:merge_merge_request",
-		" connector/github-x ":  "mcp:github-x:merge_merge_request",
-		"github-bare":           "mcp:github-bare:merge_merge_request",
+	for _, tc := range []struct{ ref, want string }{
+		{"connector/gitlab-acme", "mcp:gitlab-acme:merge_merge_request"},
+		{" connector/github-x ", "mcp:github-x:merge_merge_request"},
+		{"github-bare", "mcp:github-bare:merge_merge_request"},
 	} {
-		if got, err := merge.ToolID(ref); err != nil || got != want {
-			t.Errorf("ToolID(%q) = %q, %v, want %q", ref, got, err, want)
+		if got, err := merge.ToolID(tc.ref); err != nil || got != tc.want {
+			t.Errorf("ToolID(%q) = %q, %v, want %q", tc.ref, got, err, tc.want)
 		}
 	}
 	for _, bad := range []string{"", "connector/", "connector/a:b", "connector/a b"} {
