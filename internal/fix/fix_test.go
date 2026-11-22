@@ -273,7 +273,7 @@ func TestPass_AFindingWithAnOldReasonStartsNoCodingJob(t *testing.T) {
 }
 
 func TestPass_BlockedFindingsDoNotUseTheAttemptBudget(t *testing.T) {
-	var in []fix.Finding
+	in := make([]fix.Finding, 0, fix.MaxAttempts+3)
 	for i := range fix.MaxAttempts + 2 {
 		f := finding(string(rune('a'+i)), "P1")
 		f.BlockedReason = "old"
