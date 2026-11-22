@@ -9,13 +9,14 @@ This file is the contract. If this file and the code disagree, the code wins.
 One dispatch is one pass over one Application. The agent does these steps in order.
 
 1. Read the open findings of the Application from the graph (`internal/read`). The agent keeps only a finding at the status `open`, even if the server returns more.
-2. Order them by the priority that `cve-triage` wrote: P1 first, then P2, P3 and P4. A finding with no priority comes last (`internal/fix`, `Rank`).
-3. Decide for each finding if the agent can fix it (`internal/fix`, `Decide`).
-4. Send the first fixable finding to the coding path and get one merge request (`internal/code`).
-5. Call the merge tool of the connector for the merge request, and wait for the merge slot (`internal/merge`).
-6. Write a reason on each finding that it cannot fix, and go on to the next finding (`internal/emit`). A coding mission that did not complete gets no reason. The next pass tries that finding again.
+2. Read the findings at `fixing` that have a merge request key, a fix head and fix files (`PendingMerges`). Call the merge tool once for the one of the highest priority. A named run merges only the named finding. The daemon frees the merge slot when a run ends with the merge request open, and it queues the slot again (gibson#1626). The next pass merges that merge request.
+3. Order the open findings by the priority that `cve-triage` wrote: P1 first, then P2, P3 and P4. A finding with no priority comes last (`internal/fix`, `Rank`).
+4. Decide for each finding if the agent can fix it (`internal/fix`, `Decide`).
+5. Send the first fixable finding to the coding path and get one merge request (`internal/code`).
+6. Call the merge tool of the connector for the new merge request, and wait for the merge slot (`internal/merge`).
+7. Write a reason on each finding that it cannot fix, and go on to the next finding (`internal/emit`). A coding mission that did not complete gets no reason. The next pass tries that finding again.
 
-The pass starts at most three coding jobs (`fix.MaxAttempts`). One dispatch gives at most one merge request.
+The pass starts at most three coding jobs (`fix.MaxAttempts`). One dispatch gives at most one merge request. One pass makes at most one merge call. If step 2 made it, the merge request of this pass waits for the next pass.
 
 ## How a fix is written: the decision
 

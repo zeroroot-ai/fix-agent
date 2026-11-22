@@ -75,17 +75,64 @@ func (r *Reader) OpenFindings(ctx context.Context, application string) ([]fix.Fi
 		if f.Status != fix.StatusOpen {
 			continue
 		}
-		out = append(out, fix.Finding{
-			ID:             id,
-			Vulnerability:  strings.TrimSpace(f.VulnerabilityID),
-			Severity:       strings.ToLower(strings.TrimSpace(f.Severity)),
-			PlaceLabel:     strings.TrimSpace(f.PlaceLabel),
-			PlaceKey:       strings.TrimSpace(f.PlaceKey),
-			Priority:       strings.ToUpper(strings.TrimSpace(f.Priority)),
-			PriorityReason: strings.TrimSpace(f.PriorityReason),
-			Reachable:      f.Reachable,
-			Exposed:        f.Reachable && f.Exposed,
-		})
+		out = append(out, finding(id, f))
 	}
 	return out, nil
+}
+
+// PendingMerges returns the Findings at fixing whose merge request is still
+// open and ready to merge: the row has a merge request key, a fix head and fix
+// files. The daemon fills all three, and the agent never takes them from a
+// coding job.
+//
+// A fixing row that lacks one of them is not a pending merge. The merge step
+// would skip it, so the pass leaves it for a person or for the daemon.
+//
+// The read asks the server for the status fixing, and it also keeps only the
+// rows at that status. A row with no finding id is dropped, as in OpenFindings.
+func (r *Reader) PendingMerges(ctx context.Context, application string) ([]fix.Pending, error) {
+	app := strings.TrimSpace(application)
+	if app == "" {
+		return nil, errors.New("read: no application")
+	}
+	raw, err := r.src.ApplicationFindings(ctx, app, []string{fix.StatusFixing}, ServerDefaultLimit)
+	if err != nil {
+		return nil, fmt.Errorf("read: pending merges for %s: %w", app, err)
+	}
+	out := make([]fix.Pending, 0, len(raw))
+	for _, f := range raw {
+		id := strings.TrimSpace(f.FindingID)
+		if id == "" || f.Status != fix.StatusFixing {
+			continue
+		}
+		d := fix.Delivery{
+			Status:       f.Status,
+			MergeRequest: strings.TrimSpace(f.MergeRequest),
+			HeadSHA:      strings.TrimSpace(f.FixHeadSHA),
+		}
+		if d.MergeRequest == "" || d.HeadSHA == "" || len(f.FixFiles) == 0 {
+			continue
+		}
+		for _, ff := range f.FixFiles {
+			d.Files = append(d.Files, fix.File{
+				Path: ff.Path, Change: ff.Change, PreviousPath: ff.PreviousPath, BlobSHA: ff.BlobSHA, Mode: ff.Mode,
+			})
+		}
+		out = append(out, fix.Pending{Finding: finding(id, f), Delivery: d})
+	}
+	return out, nil
+}
+
+func finding(id string, f agent.ApplicationFinding) fix.Finding {
+	return fix.Finding{
+		ID:             id,
+		Vulnerability:  strings.TrimSpace(f.VulnerabilityID),
+		Severity:       strings.ToLower(strings.TrimSpace(f.Severity)),
+		PlaceLabel:     strings.TrimSpace(f.PlaceLabel),
+		PlaceKey:       strings.TrimSpace(f.PlaceKey),
+		Priority:       strings.ToUpper(strings.TrimSpace(f.Priority)),
+		PriorityReason: strings.TrimSpace(f.PriorityReason),
+		Reachable:      f.Reachable,
+		Exposed:        f.Reachable && f.Exposed,
+	}
 }

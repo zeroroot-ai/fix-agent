@@ -116,9 +116,19 @@ type File struct {
 	Mode string
 }
 
-// Reader returns the open Findings of one Application.
+// Pending is a Finding at fixing whose merge request is still open, with the
+// delivery that the daemon recorded for it. An earlier pass opened the merge
+// request, and no merge call has merged it.
+type Pending struct {
+	Finding  Finding
+	Delivery Delivery
+}
+
+// Reader returns the open Findings of one Application, and the Findings whose
+// merge request waits for a merge.
 type Reader interface {
 	OpenFindings(ctx context.Context, application string) ([]Finding, error)
+	PendingMerges(ctx context.Context, application string) ([]Pending, error)
 }
 
 // Coder sends one Finding to the coding path and returns the merge request.
@@ -136,7 +146,7 @@ const (
 	// MergeDone means that the connector merged the merge request.
 	MergeDone MergeState = "merged"
 	// MergeWaiting means that the daemon granted no merge slot while the agent
-	// waited. The merge request stays open. A slot that the daemon grants later is not used (gibson#1609).
+	// waited. The merge request stays open. The daemon frees the slot when the run ends with the merge request open, and it queues the slot again (gibson#1626). The next pass merges it.
 	MergeWaiting MergeState = "waiting"
 	// MergeNotAllowed means that the agent holds no merge grant. The merge
 	// request stays open for a person.
@@ -196,6 +206,14 @@ type Summary struct {
 	// Merge is the outcome of the merge step for Delivered. It is the zero
 	// value when no merge request exists.
 	Merge Merge
+	// Resumed is the Finding at fixing whose open merge request this pass
+	// tried to merge before the coding loop. It is nil when no merge request
+	// was pending.
+	Resumed *Finding
+	// ResumedDelivery is the merge request of Resumed.
+	ResumedDelivery Delivery
+	// ResumedMerge is the outcome of the merge step for Resumed.
+	ResumedMerge Merge
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
 	// Deferred lists the Findings whose coding job failed, was canceled, or
@@ -217,13 +235,34 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 	if err != nil {
 		return Summary{}, fmt.Errorf("fix: read open findings for %s: %w", app, err)
 	}
+	pending, err := reader.PendingMerges(ctx, app)
+	if err != nil {
+		return Summary{}, fmt.Errorf("fix: read pending merges for %s: %w", app, err)
+	}
 	sum := Summary{Total: len(findings)}
 	ranked := Rank(findings)
 	if only != "" {
 		ranked = only1(ranked, only)
-		if len(ranked) == 0 {
+		pending = onlyPending(pending, only)
+		if len(ranked) == 0 && len(pending) == 0 {
 			return sum, fmt.Errorf("fix: finding %s is not an open finding of %s", only, app)
 		}
+	}
+
+	// A merge request that an earlier pass opened can still be open. The slot
+	// can come after that run ended, so this pass merges the one of the
+	// highest priority. The pass makes at most one merge call.
+	merged := false
+	if p, ok := firstPending(pending); ok {
+		slog.Info("resume the merge of an open merge request", "finding", p.Finding.ID, "merge_request", p.Delivery.MergeRequest)
+		m, err := merger.Merge(ctx, repo, p.Delivery)
+		if err != nil {
+			return sum, fmt.Errorf("fix: merge the open merge request of finding %s: %w", p.Finding.ID, err)
+		}
+		slog.Info("merge step ended", "finding", p.Finding.ID, "state", m.State, "reason", m.Reason)
+		f := p.Finding
+		sum.Resumed, sum.ResumedDelivery, sum.ResumedMerge = &f, p.Delivery, m
+		merged = true
 	}
 
 	for _, f := range ranked {
@@ -255,6 +294,12 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		}
 		slog.Info("merge request opened", "finding", f.ID, "status", del.Status, "mission", del.MissionID)
 		sum.Delivered, sum.Delivery = &f, del
+		if merged {
+			// The pass made its one merge call for the resumed merge request.
+			// The next pass merges this one.
+			sum.Merge = Merge{State: MergeSkipped, Reason: "this pass already made a merge call for finding " + sum.Resumed.ID}
+			break
+		}
 		m, err := merger.Merge(ctx, repo, del)
 		if err != nil {
 			return sum, fmt.Errorf("fix: merge the merge request of finding %s: %w", f.ID, err)
@@ -272,6 +317,31 @@ func skip(ctx context.Context, e Emitter, sum *Summary, f Finding, reason string
 	}
 	sum.Skipped = append(sum.Skipped, Skip{Finding: f, Reason: reason})
 	return nil
+}
+
+func onlyPending(in []Pending, id string) []Pending {
+	for _, p := range in {
+		if p.Finding.ID == id {
+			return []Pending{p}
+		}
+	}
+	return nil
+}
+
+// firstPending returns the pending merge of the highest priority. Rank gives
+// the order, so two runs over the same graph choose the same one.
+func firstPending(in []Pending) (Pending, bool) {
+	if len(in) == 0 {
+		return Pending{}, false
+	}
+	byID := make(map[string]Pending, len(in))
+	fs := make([]Finding, 0, len(in))
+	for _, p := range in {
+		byID[p.Finding.ID] = p
+		fs = append(fs, p.Finding)
+	}
+	p, ok := byID[Rank(fs)[0].ID]
+	return p, ok
 }
 
 func only1(in []Finding, id string) []Finding {

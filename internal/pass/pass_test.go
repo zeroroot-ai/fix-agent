@@ -441,6 +441,20 @@ func TestRun_ANamedFindingIsTheOneFixed(t *testing.T) {
 	}
 }
 
+func TestRun_AFixingFindingWithAnOpenMergeRequestIsMergedByALaterPass(t *testing.T) {
+	f := []agent.ApplicationFinding{{
+		FindingID: "stuck", Status: "fixing", Priority: "P1", MergeRequest: "acme/portal!7", FixHeadSHA: "h1", FixFiles: fixFiles(),
+	}}
+	p := &fakePlatform{findings: f, result: completed(), merge: mergedAnswer}
+	res, err := pass.Run(context.Background(), p, task(fullContext()))
+	if err != nil || res.Metadata["resumed_finding"] != "stuck" || res.Metadata["resumed_merge"] == "" {
+		t.Fatalf("res %+v err %v, want the resumed merge", res, err)
+	}
+	if out, _ := res.Output.(string); !strings.Contains(strings.SplitN(out, "\n", 2)[0], "resumed the merge of stuck") {
+		t.Errorf("header does not show the resumed merge:\n%s", out)
+	}
+}
+
 func TestApplicationID(t *testing.T) {
 	for _, tc := range []struct {
 		name string

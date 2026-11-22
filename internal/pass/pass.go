@@ -172,13 +172,20 @@ func Run(ctx context.Context, p Platform, task agent.Task) (agent.Result, error)
 	// discovers none, so it stays empty. The Finding that got a merge request
 	// goes in the metadata.
 	res := agent.Result{Status: a2a.TaskStateCompleted, Output: Report(app, sum)}
-	if sum.Delivered != nil {
+	if sum.Resumed != nil {
 		res.Metadata = map[string]any{
-			"finding":        sum.Delivered.ID,
-			"finding_status": sum.Delivery.Status,
-			"mission":        sum.Delivery.MissionID,
-			"merge":          string(sum.Merge.State),
+			"resumed_finding": sum.Resumed.ID,
+			"resumed_merge":   string(sum.ResumedMerge.State),
 		}
+	}
+	if sum.Delivered != nil {
+		if res.Metadata == nil {
+			res.Metadata = map[string]any{}
+		}
+		res.Metadata["finding"] = sum.Delivered.ID
+		res.Metadata["finding_status"] = sum.Delivery.Status
+		res.Metadata["mission"] = sum.Delivery.MissionID
+		res.Metadata["merge"] = string(sum.Merge.State)
 	}
 	return res, nil
 }
@@ -206,7 +213,11 @@ func failed() agent.Result { return agent.Result{Status: a2a.TaskStateFailed} }
 // the deploy and the health signal, and it decides.
 func Report(app string, s fix.Summary) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "fix-agent: %s: %d open findings, %d coding jobs, %d without a fix\n", app, s.Total, s.Attempts, len(s.Skipped))
+	fmt.Fprintf(&b, "fix-agent: %s: %d open findings, %d coding jobs, %d without a fix", app, s.Total, s.Attempts, len(s.Skipped))
+	if s.Resumed != nil {
+		fmt.Fprintf(&b, ", resumed the merge of %s: %s", s.Resumed.ID, mergeLine(s.ResumedMerge))
+	}
+	b.WriteString("\n")
 	if s.Delivered != nil {
 		fmt.Fprintf(&b, "  merge request opened for %s: the daemon set the status %s (mission %s)",
 			s.Delivered.ID, s.Delivery.Status, s.Delivery.MissionID)

@@ -14,8 +14,14 @@ import (
 )
 
 type fakeReader struct {
-	findings []fix.Finding
-	err      error
+	findings   []fix.Finding
+	pending    []fix.Pending
+	err        error
+	pendingErr error
+}
+
+func (r fakeReader) PendingMerges(context.Context, string) ([]fix.Pending, error) {
+	return r.pending, r.pendingErr
 }
 
 func (r fakeReader) OpenFindings(context.Context, string) ([]fix.Finding, error) {
@@ -312,5 +318,95 @@ func TestPass_AFailedMergeCallFailsThePass(t *testing.T) {
 		fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeMerger{err: boom}, &fakeEmitter{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the merge error", err)
+	}
+}
+
+func pendingMR(id, prio string) fix.Pending {
+	return fix.Pending{
+		Finding: finding(id, prio),
+		Delivery: fix.Delivery{
+			Status: fix.StatusFixing, MergeRequest: "acme/portal!" + id, HeadSHA: "head-" + id,
+			Files: []fix.File{{Path: id + ".go", Change: "modified", BlobSHA: "blob", Mode: "100644"}},
+		},
+	}
+}
+
+func TestPass_APendingMergeIsMergedOnceWithItsHeadAndFiles(t *testing.T) {
+	m := &fakeMerger{}
+	p := pendingMR("a", "P2")
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{p}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MergeRequest != "acme/portal!a" || m.got[0].HeadSHA != "head-a" || len(m.got[0].Files) != 1 || m.got[0].Files[0].Mode != "100644" {
+		t.Fatalf("merge calls %+v, want one with the head and files of a", m.got)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "a" || sum.ResumedMerge.State != fix.MergeDone || sum.Delivered != nil {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_APendingMergeAndAnOpenFindingMergeOnlyThePendingOne(t *testing.T) {
+	m := &fakeMerger{state: fix.MergeWaiting}
+	coder := &fakeCoder{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("low", "P4"), pendingMR("top", "P1")}},
+		coder, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MergeRequest != "acme/portal!top" {
+		t.Fatalf("merge calls %+v, want one for top", m.got)
+	}
+	if len(coder.asked) != 1 || coder.asked[0] != "open" {
+		t.Errorf("coding jobs %v, want one for open", coder.asked)
+	}
+	if sum.Resumed == nil || sum.ResumedMerge.State != fix.MergeWaiting || sum.Delivered == nil || sum.Merge.State != fix.MergeSkipped {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_ANamedRunResumesOnlyTheNamedPendingFinding(t *testing.T) {
+	m := &fakeMerger{}
+	coder := &fakeCoder{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "low",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("low", "P4"), pendingMR("top", "P1")}},
+		coder, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MergeRequest != "acme/portal!low" || len(coder.asked) != 0 {
+		t.Fatalf("merge calls %+v coding jobs %v, want low only and no job", m.got, coder.asked)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "low" {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_ANamedRunForAnotherFindingDoesNotMergeAPendingOne(t *testing.T) {
+	m := &fakeMerger{}
+	_, err := fix.Pass(context.Background(), "app", repo, "open",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 1 || m.got[0].MissionID != "mis-open" {
+		t.Fatalf("err %v merge calls %+v, want one for the new merge request of open only", err, m.got)
+	}
+}
+
+func TestPass_AFailedMergeOfAPendingMergeFailsThePass(t *testing.T) {
+	boom := errors.New("down")
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("a", "P1")}}, &fakeCoder{}, &fakeMerger{err: boom}, &fakeEmitter{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the merge error", err)
+	}
+}
+
+func TestPass_AFailedPendingReadFailsThePass(t *testing.T) {
+	boom := errors.New("down")
+	_, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{pendingErr: boom}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the read error", err)
 	}
 }
