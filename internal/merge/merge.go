@@ -23,10 +23,11 @@
 // granted yet" is one) means that the call can succeed later. The agent waits
 // and calls again until the Wait bound ends. One call has its own bound
 // (CallTimeout), and a call that hangs ends at it, inside the wait. An agent
-// that stops waiting leaves the merge request open. The daemon frees the slot
-// (gibson#1626) when the run ends with the merge request open, and
-// it queues the slot again. A later pass of the agent merges the merge request
-// with a new mission, and the daemon accepts that call.
+// that stops waiting leaves the merge request open. The daemon frees a granted
+// slot that no merge used within the grant window (45 minutes by default) when
+// the host shows the merge request still open, and it queues the merge request
+// again after the requeue backoff (gibson#1626). A later pass of the agent
+// merges the merge request with a new mission, and the daemon accepts that call.
 //
 // # The head and the files of the fix
 //
