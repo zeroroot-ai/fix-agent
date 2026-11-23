@@ -8,10 +8,12 @@
 //
 // Gibson already has a path that writes a change: a job on a bank of
 // always-on coding agents (ADR-0119). A mission node of the type job opens the
-// job, and the deliverable kind MERGE_REQUEST makes the driver push the job
-// branch and open the merge request under the connector token of the job. The
-// coding agent never holds that token. A second coding agent here would copy
-// that path and hold a credential that the first one does not need.
+// job. The coding agent reads the repository and opens the merge request only
+// through the governed connector tools (list_tree, read_file and
+// open_merge_request) under the turn grant of the job. The daemon binds the
+// merge request to the job id of the verified grant. The coding agent never
+// holds a Git host token. A second coding agent here would copy that path and
+// need a credential that the first one does not hold.
 //
 // So this package builds a mission of one job node, runs it, waits, and then
 // reads the status of the Finding.
