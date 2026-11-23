@@ -427,7 +427,7 @@ func TestMerge_AnAnswerWithNoResultObjectIsAnErrorAndIsNotResent(t *testing.T) {
 	}
 }
 
-// A person committed to the fix branch before the coding job pushed. The head
+// A person committed to the fix branch before the coding job opened the merge request. The head
 // pin passes, because the agent reads the head after that commit. The set of
 // paths does not equal the set of the job, so the agent does not merge.
 func TestMerge_ABranchWithAForeignCommitIsAFinalRefusal(t *testing.T) {
