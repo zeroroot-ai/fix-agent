@@ -161,7 +161,7 @@ const (
 	MergeHeadMoved MergeState = "head_moved"
 	// MergeForeignChange means that the files of the merge request are not the
 	// files that the daemon recorded for the fix, for example a person committed
-	// to the branch before the job pushed. It also covers a change of mode, a
+	// to the branch before the job opened the merge request. It also covers a change of mode, a
 	// list that the host cut and a list that the host did not give. The refusal
 	// is final.
 	MergeForeignChange MergeState = "foreign_change"

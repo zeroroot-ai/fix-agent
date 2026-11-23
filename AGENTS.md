@@ -27,7 +27,7 @@ Checked on `origin/epic/fix-loop` of `gibson` on 2026-11-20:
 | Path | Writes a change? | Why it is not this agent |
 |---|---|---|
 | A bank of always-on coding agents (`internal/platform/bank/`, ADR-0119) | Yes. A member runs Claude Code in a sandbox with its own worktrees. | This is the path that the agent uses. |
-| The job node (`internal/engine/jobnode/`) | Opens a job on a bank and runs the verify loop. The deliverable kind `MERGE_REQUEST` makes the driver push the job branch and open the merge request under the connector token of the job. | This is the path that the agent uses. |
+| The job node (`internal/engine/jobnode/`) | Opens a job on a bank and runs the verify loop. The coding agent opens the merge request through the governed `open_merge_request` connector tool under the turn grant of the job. It holds no Git host token. | This is the path that the agent uses. |
 | The catalog agents `zerocool` and `claude` | They run the same coding agent. | A second route to the same code. |
 | `cve-triage` | No. It sets a priority and changes no code. | It is the producer of the order that this agent reads. |
 
