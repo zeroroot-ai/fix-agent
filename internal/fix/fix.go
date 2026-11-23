@@ -147,7 +147,9 @@ const (
 	// MergeDone means that the connector merged the merge request.
 	MergeDone MergeState = "merged"
 	// MergeWaiting means that the daemon granted no merge slot while the agent
-	// waited. The merge request stays open. After gibson#1626 merges, the daemon frees the slot when the run ends with the merge request open, and it queues the slot again. The next pass merges it.
+	// waited. The merge request stays open. The daemon frees the slot when the run ends
+	// with the merge request open, and it queues the slot again (gibson#1626).
+	// The next pass merges it.
 	MergeWaiting MergeState = "waiting"
 	// MergeNotAllowed means that the agent holds no merge grant. The merge
 	// request stays open for a person.
