@@ -11,9 +11,9 @@
 // three steps. The call must pass the can_execute check of the grant. The tool
 // has the role merge in its manifest, so the call must name a merge request
 // that holds a granted slot in the World of the tenant. The slot binds the
-// mission of the fix, and only the mission that originated it may merge with
-// it. The agent runs in that parent mission. The word of the agent is never
-// the source of any of these facts.
+// merge request and the tenant, not a mission (gibson#1609). So a later pass
+// with a new mission can merge a merge request that an earlier mission opened.
+// The word of the agent is never the source of any of these facts.
 //
 // # How the agent learns of the grant
 //
@@ -23,10 +23,11 @@
 // granted yet" is one) means that the call can succeed later. The agent waits
 // and calls again until the Wait bound ends. One call has its own bound
 // (CallTimeout), and a call that hangs ends at it, inside the wait. An agent
-// that stops waiting leaves the merge request open. After gibson#1626 merges,
-// the daemon frees the slot when the run ends with the merge request open, and
-// it queues the slot again. A later pass of the agent merges the merge request
-// with a new mission, and the daemon accepts that call.
+// that stops waiting leaves the merge request open. The daemon frees a granted
+// slot that no merge used within the grant window (45 minutes by default) when
+// the host shows the merge request still open, and it queues the merge request
+// again after the requeue backoff (gibson#1626). A later pass of the agent
+// merges the merge request with a new mission, and the daemon accepts that call.
 //
 // # The head and the files of the fix
 //
