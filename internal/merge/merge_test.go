@@ -50,6 +50,8 @@ type gate struct {
 	// transient is the refusal text for the first transientN merge calls.
 	transient  string
 	transientN int
+	// readState is the state that merge_request_state returns. Empty means open.
+	readState string
 	// emptyReply makes the merge call answer with no result object.
 	emptyReply bool
 }
@@ -72,6 +74,9 @@ func (g *gate) CallToolProto(_ context.Context, name string, req, resp protolib.
 			head = "h1"
 		}
 		res := map[string]any{"state": "open"}
+		if g.readState != "" {
+			res["state"] = g.readState
+		}
 		if !g.noHead {
 			res["head_sha"] = head
 		}
@@ -704,5 +709,48 @@ func TestMerge_ACallBoundDoesNotOutliveTheWait(t *testing.T) {
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("the step took %v, want it to end with the wait of 50 ms", d)
+	}
+}
+
+func TestMerge_AMergeRequestThatIsAlreadyMergedIsDoneWithNoCall(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, readState: "merged"}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeDone || got.Called || g.calls != 0 {
+		t.Fatalf("got %+v err %v after %d calls, want merged with no call", got, err, g.calls)
+	}
+}
+
+func TestMerge_AClosedMergeRequestIsRefusedWithNoCallAndNoWait(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1, readState: "closed"}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeRefused || got.Called || g.calls != 0 || g.reads != 1 {
+		t.Fatalf("got %+v err %v after %d calls %d reads, want refused with no call and one read", got, err, g.calls, g.reads)
+	}
+}
+
+func TestMerge_SaysIfItSentTheMergeCall(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1}
+	got, err := run(t, g, fast, delivery)
+	if err != nil || got.State != fix.MergeDone || !got.Called {
+		t.Fatalf("got %+v err %v, want merged with Called", got, err)
+	}
+	g = &gate{granted: true, slotAfter: 1, head: "h2-pushed"}
+	if got, _ = run(t, g, fast, delivery); got.State != fix.MergeHeadMoved || got.Called {
+		t.Fatalf("got %+v, want head_moved with no call", got)
+	}
+}
+
+func TestMerge_AMergeBudgetInTheContextBoundsTheWait(t *testing.T) {
+	g := &gate{granted: true, slotAfter: 1 << 30}
+	m, err := merge.New(g, merge.Config{Wait: time.Hour, Poll: time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	b := &fix.MergeBudget{}
+	b.Deadline(30 * time.Millisecond)
+	start := time.Now()
+	got, err := m.Merge(fix.WithMergeBudget(context.Background(), b), repo, delivery)
+	if err != nil || got.State != fix.MergeWaiting || time.Since(start) > 5*time.Second {
+		t.Fatalf("got %+v err %v after %s, want waiting at the end of the budget and not after Wait", got, err, time.Since(start))
 	}
 }

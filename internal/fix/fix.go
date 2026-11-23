@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 )
 
 // MaxAttempts bounds the coding jobs that one pass starts. A coding job is
@@ -116,9 +117,19 @@ type File struct {
 	Mode string
 }
 
-// Reader returns the open Findings of one Application.
+// Pending is a Finding at fixing whose merge request is still open, with the
+// delivery that the daemon recorded for it. An earlier pass opened the merge
+// request, and no merge call has merged it.
+type Pending struct {
+	Finding  Finding
+	Delivery Delivery
+}
+
+// Reader returns the open Findings of one Application, and the Findings whose
+// merge request waits for a merge.
 type Reader interface {
 	OpenFindings(ctx context.Context, application string) ([]Finding, error)
+	PendingMerges(ctx context.Context, application string) ([]Pending, error)
 }
 
 // Coder sends one Finding to the coding path and returns the merge request.
@@ -136,7 +147,7 @@ const (
 	// MergeDone means that the connector merged the merge request.
 	MergeDone MergeState = "merged"
 	// MergeWaiting means that the daemon granted no merge slot while the agent
-	// waited. The merge request stays open. A slot that the daemon grants later is not used (gibson#1609).
+	// waited. The merge request stays open. After gibson#1626 merges, the daemon frees the slot when the run ends with the merge request open, and it queues the slot again. The next pass merges it.
 	MergeWaiting MergeState = "waiting"
 	// MergeNotAllowed means that the agent holds no merge grant. The merge
 	// request stays open for a person.
@@ -163,6 +174,10 @@ const (
 // Merge is the outcome of the merge step.
 type Merge struct {
 	State MergeState
+	// Called is true when the step sent the merge call to the daemon. A step
+	// that ended on the state of the merge request, or on a missing fact, sent
+	// no call.
+	Called bool
 	// Reason is one plain sentence. It is empty for MergeDone.
 	Reason string
 }
@@ -196,6 +211,17 @@ type Summary struct {
 	// Merge is the outcome of the merge step for Delivered. It is the zero
 	// value when no merge request exists.
 	Merge Merge
+	// Resumed is the Finding at fixing whose open merge request this pass
+	// tried to merge before the coding loop. It is nil when no merge request
+	// was pending.
+	Resumed *Finding
+	// ResumedDelivery is the merge request of Resumed.
+	ResumedDelivery Delivery
+	// ResumedMerge is the outcome of the merge step for Resumed.
+	ResumedMerge Merge
+	// Passed lists the pending merges that ended with a final outcome before
+	// Resumed, or all of them when none counted. The pass went on to the next pending merge.
+	Passed []Resumption
 	// Skipped lists the Findings that got a reason.
 	Skipped []Skip
 	// Deferred lists the Findings whose coding job failed, was canceled, or
@@ -204,6 +230,56 @@ type Summary struct {
 	Deferred []Skip
 	// Attempts is the number of coding jobs that the pass started.
 	Attempts int
+}
+
+// Resumption is one pending merge that the pass tried.
+type Resumption struct {
+	Finding  Finding
+	Delivery Delivery
+	Merge    Merge
+}
+
+// counts says if a merge step is the one merge step of the pass. A step that
+// waited for the slot is, and a step that merged with a merge call is. A final
+// outcome is not, and the pass goes on to the next merge request. This holds
+// for a final refusal after a merge call too, so a merge request that the
+// branch protection refuses does not starve the next one.
+func (m Merge) counts() bool {
+	return m.State == MergeWaiting || (m.State == MergeDone && m.Called)
+}
+
+// MergeBudget is the one wait budget that all pending merge steps of a pass
+// share. The first step that reads the deadline starts it.
+type MergeBudget struct {
+	deadline time.Time
+	started  bool
+}
+
+// Deadline returns the end of the budget. The first call sets it to wait from
+// now, and each later call returns the same time.
+func (b *MergeBudget) Deadline(wait time.Duration) time.Time {
+	if !b.started {
+		b.deadline, b.started = time.Now().Add(wait), true
+	}
+	return b.deadline
+}
+
+// Spent says if the budget started and its time is used.
+func (b *MergeBudget) Spent() bool { return b.started && !time.Now().Before(b.deadline) }
+
+type budgetKey struct{}
+
+// WithMergeBudget returns a context that carries the budget. A Merger that
+// finds a budget in its context waits until the end of the budget and not for
+// its own bound.
+func WithMergeBudget(ctx context.Context, b *MergeBudget) context.Context {
+	return context.WithValue(ctx, budgetKey{}, b)
+}
+
+// MergeBudgetFrom returns the budget of the context, or nil.
+func MergeBudgetFrom(ctx context.Context) *MergeBudget {
+	b, _ := ctx.Value(budgetKey{}).(*MergeBudget)
+	return b
 }
 
 // Pass runs one pass over one Application.
@@ -217,13 +293,44 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 	if err != nil {
 		return Summary{}, fmt.Errorf("fix: read open findings for %s: %w", app, err)
 	}
+	pending, err := reader.PendingMerges(ctx, app)
+	if err != nil {
+		return Summary{}, fmt.Errorf("fix: read pending merges for %s: %w", app, err)
+	}
 	sum := Summary{Total: len(findings)}
 	ranked := Rank(findings)
 	if only != "" {
 		ranked = only1(ranked, only)
-		if len(ranked) == 0 {
+		pending = onlyPending(pending, only)
+		if len(ranked) == 0 && len(pending) == 0 {
 			return sum, fmt.Errorf("fix: finding %s is not an open finding of %s", only, app)
 		}
+	}
+
+	// A merge request that an earlier pass opened can still be open. The slot
+	// can come after that run ended, so this pass merges the one of the
+	// highest priority. The pass makes at most one merge step that waits or merges.
+	merged := false
+	budget := &MergeBudget{}
+	pctx := WithMergeBudget(ctx, budget)
+	for _, p := range rankPending(pending) {
+		if budget.Spent() {
+			// All pending merge steps share one wait budget.
+			break
+		}
+		slog.Info("resume the merge of an open merge request", "finding", p.Finding.ID, "merge_request", p.Delivery.MergeRequest)
+		m, err := merger.Merge(pctx, repo, p.Delivery)
+		if err != nil {
+			return sum, fmt.Errorf("fix: merge the open merge request of finding %s: %w", p.Finding.ID, err)
+		}
+		slog.Info("merge step ended", "finding", p.Finding.ID, "state", m.State, "reason", m.Reason, "called", m.Called)
+		f := p.Finding
+		if m.counts() {
+			sum.Resumed, sum.ResumedDelivery, sum.ResumedMerge = &f, p.Delivery, m
+			merged = true
+			break
+		}
+		sum.Passed = append(sum.Passed, Resumption{Finding: f, Delivery: p.Delivery, Merge: m})
 	}
 
 	for _, f := range ranked {
@@ -255,6 +362,12 @@ func Pass(ctx context.Context, app string, repo Repository, only string,
 		}
 		slog.Info("merge request opened", "finding", f.ID, "status", del.Status, "mission", del.MissionID)
 		sum.Delivered, sum.Delivery = &f, del
+		if merged {
+			// The pass made its one merge step for the resumed merge request.
+			// The next pass merges this one.
+			sum.Merge = Merge{State: MergeSkipped, Reason: "this pass already made a merge step for finding " + sum.Resumed.ID}
+			break
+		}
 		m, err := merger.Merge(ctx, repo, del)
 		if err != nil {
 			return sum, fmt.Errorf("fix: merge the merge request of finding %s: %w", f.ID, err)
@@ -272,6 +385,31 @@ func skip(ctx context.Context, e Emitter, sum *Summary, f Finding, reason string
 	}
 	sum.Skipped = append(sum.Skipped, Skip{Finding: f, Reason: reason})
 	return nil
+}
+
+func onlyPending(in []Pending, id string) []Pending {
+	for _, p := range in {
+		if p.Finding.ID == id {
+			return []Pending{p}
+		}
+	}
+	return nil
+}
+
+// rankPending returns the pending merges in the order of Rank, the highest
+// priority first.
+func rankPending(in []Pending) []Pending {
+	byID := make(map[string]Pending, len(in))
+	fs := make([]Finding, 0, len(in))
+	for _, p := range in {
+		byID[p.Finding.ID] = p
+		fs = append(fs, p.Finding)
+	}
+	out := make([]Pending, 0, len(in))
+	for _, f := range Rank(fs) {
+		out = append(out, byID[f.ID])
+	}
+	return out
 }
 
 func only1(in []Finding, id string) []Finding {

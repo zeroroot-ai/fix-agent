@@ -9,13 +9,20 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeroroot-ai/fix-agent/internal/fix"
 )
 
 type fakeReader struct {
-	findings []fix.Finding
-	err      error
+	findings   []fix.Finding
+	pending    []fix.Pending
+	err        error
+	pendingErr error
+}
+
+func (r fakeReader) PendingMerges(context.Context, string) ([]fix.Pending, error) {
+	return r.pending, r.pendingErr
 }
 
 func (r fakeReader) OpenFindings(context.Context, string) ([]fix.Finding, error) {
@@ -43,6 +50,9 @@ type fakeMerger struct {
 	state fix.MergeState
 	err   error
 	got   []fix.Delivery
+	// byMR answers by merge request key. Called is true unless noCall names the key.
+	byMR   map[string]fix.MergeState
+	noCall map[string]bool
 }
 
 func (m *fakeMerger) Merge(_ context.Context, _ fix.Repository, d fix.Delivery) (fix.Merge, error) {
@@ -50,10 +60,13 @@ func (m *fakeMerger) Merge(_ context.Context, _ fix.Repository, d fix.Delivery) 
 	if m.err != nil {
 		return fix.Merge{}, m.err
 	}
-	if m.state == "" {
-		return fix.Merge{State: fix.MergeDone}, nil
+	if st, ok := m.byMR[d.MergeRequest]; ok {
+		return fix.Merge{State: st, Reason: "because", Called: !m.noCall[d.MergeRequest]}, nil
 	}
-	return fix.Merge{State: m.state, Reason: "because"}, nil
+	if m.state == "" {
+		return fix.Merge{State: fix.MergeDone, Called: true}, nil
+	}
+	return fix.Merge{State: m.state, Reason: "because", Called: true}, nil
 }
 
 type fakeEmitter struct {
@@ -312,5 +325,198 @@ func TestPass_AFailedMergeCallFailsThePass(t *testing.T) {
 		fakeReader{findings: []fix.Finding{finding("a", "P1")}}, &fakeCoder{}, &fakeMerger{err: boom}, &fakeEmitter{})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the merge error", err)
+	}
+}
+
+func pendingMR(id, prio string) fix.Pending {
+	return fix.Pending{
+		Finding: finding(id, prio),
+		Delivery: fix.Delivery{
+			Status: fix.StatusFixing, MergeRequest: "acme/portal!" + id, HeadSHA: "head-" + id,
+			Files: []fix.File{{Path: id + ".go", Change: "modified", BlobSHA: "blob", Mode: "100644"}},
+		},
+	}
+}
+
+func TestPass_APendingMergeIsMergedOnceWithItsHeadAndFiles(t *testing.T) {
+	m := &fakeMerger{}
+	p := pendingMR("a", "P2")
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{p}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MergeRequest != "acme/portal!a" || m.got[0].HeadSHA != "head-a" || len(m.got[0].Files) != 1 || m.got[0].Files[0].Mode != "100644" {
+		t.Fatalf("merge calls %+v, want one with the head and files of a", m.got)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "a" || sum.ResumedMerge.State != fix.MergeDone || sum.Delivered != nil {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_APendingMergeAndAnOpenFindingMergeOnlyThePendingOne(t *testing.T) {
+	m := &fakeMerger{state: fix.MergeWaiting}
+	coder := &fakeCoder{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("low", "P4"), pendingMR("top", "P1")}},
+		coder, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MergeRequest != "acme/portal!top" {
+		t.Fatalf("merge calls %+v, want one for top", m.got)
+	}
+	if len(coder.asked) != 1 || coder.asked[0] != "open" {
+		t.Errorf("coding jobs %v, want one for open", coder.asked)
+	}
+	if sum.Resumed == nil || sum.ResumedMerge.State != fix.MergeWaiting || sum.Delivered == nil || sum.Merge.State != fix.MergeSkipped {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_ANamedRunResumesOnlyTheNamedPendingFinding(t *testing.T) {
+	m := &fakeMerger{}
+	coder := &fakeCoder{}
+	sum, err := fix.Pass(context.Background(), "app", repo, "low",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("low", "P4"), pendingMR("top", "P1")}},
+		coder, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 1 || m.got[0].MergeRequest != "acme/portal!low" || len(coder.asked) != 0 {
+		t.Fatalf("merge calls %+v coding jobs %v, want low only and no job", m.got, coder.asked)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "low" {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_ANamedRunForAnotherFindingDoesNotMergeAPendingOne(t *testing.T) {
+	m := &fakeMerger{}
+	_, err := fix.Pass(context.Background(), "app", repo, "open",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 1 || m.got[0].MissionID != "mis-open" {
+		t.Fatalf("err %v merge calls %+v, want one for the new merge request of open only", err, m.got)
+	}
+}
+
+func TestPass_AFailedMergeOfAPendingMergeFailsThePass(t *testing.T) {
+	boom := errors.New("down")
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("a", "P1")}}, &fakeCoder{}, &fakeMerger{err: boom}, &fakeEmitter{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the merge error", err)
+	}
+}
+
+func TestPass_AFailedPendingReadFailsThePass(t *testing.T) {
+	boom := errors.New("down")
+	_, err := fix.Pass(context.Background(), "app", repo, "", fakeReader{pendingErr: boom}, &fakeCoder{}, &fakeMerger{}, &fakeEmitter{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the read error", err)
+	}
+}
+
+func TestPass_AFinalOutcomeWithNoCallGoesOnToTheNextPendingMerge(t *testing.T) {
+	m := &fakeMerger{
+		byMR:   map[string]fix.MergeState{"acme/portal!top": fix.MergeRefused, "acme/portal!mid": fix.MergeWaiting},
+		noCall: map[string]bool{"acme/portal!top": true},
+	}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("low", "P4"), pendingMR("mid", "P2"), pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil {
+		t.Fatalf("Pass: %v", err)
+	}
+	if len(m.got) != 2 || m.got[0].MergeRequest != "acme/portal!top" || m.got[1].MergeRequest != "acme/portal!mid" {
+		t.Fatalf("merge calls %+v, want top then mid", m.got)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "mid" || len(sum.Passed) != 1 || sum.Passed[0].Finding.ID != "top" {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_AFinalRefusalAfterACallGoesOnToTheNextPendingMerge(t *testing.T) {
+	m := &fakeMerger{byMR: map[string]fix.MergeState{"acme/portal!top": fix.MergeRefused, "acme/portal!mid": fix.MergeDone}}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("mid", "P2"), pendingMR("top", "P1")}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 2 {
+		t.Fatalf("err %v merge calls %+v, want two", err, m.got)
+	}
+	if sum.Resumed == nil || sum.Resumed.ID != "mid" || len(sum.Passed) != 1 || sum.Passed[0].Finding.ID != "top" {
+		t.Errorf("summary = %+v", sum)
+	}
+}
+
+func TestPass_AWaitingStepStopsThePendingMerges(t *testing.T) {
+	m := &fakeMerger{byMR: map[string]fix.MergeState{"acme/portal!top": fix.MergeWaiting}}
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("mid", "P2"), pendingMR("top", "P1")}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 1 {
+		t.Fatalf("err %v merge calls %+v, want one", err, m.got)
+	}
+}
+
+func TestPass_AFindingThatOnlyWentToPassedIsNotResumed(t *testing.T) {
+	m := &fakeMerger{byMR: map[string]fix.MergeState{"acme/portal!top": fix.MergeRefused}}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("top", "P1")}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || sum.Resumed != nil || len(sum.Passed) != 1 {
+		t.Fatalf("err %v summary %+v, want no Resumed and one Passed", err, sum)
+	}
+}
+
+// budgetMerger uses up the shared budget in its first step and refuses.
+type budgetMerger struct{ got []string }
+
+func (m *budgetMerger) Merge(ctx context.Context, _ fix.Repository, d fix.Delivery) (fix.Merge, error) {
+	m.got = append(m.got, d.MergeRequest)
+	b := fix.MergeBudgetFrom(ctx)
+	if b == nil {
+		return fix.Merge{}, errors.New("no budget in the context")
+	}
+	b.Deadline(time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	return fix.Merge{State: fix.MergeRefused, Called: true}, nil
+}
+
+func TestPass_PendingMergesShareOneWaitBudget(t *testing.T) {
+	m := &budgetMerger{}
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{pending: []fix.Pending{pendingMR("a", "P1"), pendingMR("b", "P2"), pendingMR("c", "P3")}}, &fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 1 {
+		t.Fatalf("err %v merge steps %v, want one: the budget was used", err, m.got)
+	}
+}
+
+func TestPass_WhenNoPendingMergeCountsTheNewMergeRequestIsMerged(t *testing.T) {
+	m := &fakeMerger{
+		byMR:   map[string]fix.MergeState{"acme/portal!top": fix.MergeDone},
+		noCall: map[string]bool{"acme/portal!top": true},
+	}
+	sum, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.got) != 2 || sum.Merge.State != fix.MergeDone {
+		t.Fatalf("err %v merge calls %+v merge %+v, want a merge step for the new merge request", err, m.got, sum.Merge)
+	}
+}
+
+// ctxMerger records if the context of each step carries a pending budget.
+type ctxMerger struct{ budget []bool }
+
+func (m *ctxMerger) Merge(ctx context.Context, _ fix.Repository, _ fix.Delivery) (fix.Merge, error) {
+	m.budget = append(m.budget, fix.MergeBudgetFrom(ctx) != nil)
+	return fix.Merge{State: fix.MergeRefused, Called: true}, nil
+}
+
+func TestPass_TheMergeOfTheNewDeliveryGetsNoPendingBudget(t *testing.T) {
+	m := &ctxMerger{}
+	_, err := fix.Pass(context.Background(), "app", repo, "",
+		fakeReader{findings: []fix.Finding{finding("open", "P1")}, pending: []fix.Pending{pendingMR("top", "P1")}},
+		&fakeCoder{}, m, &fakeEmitter{})
+	if err != nil || len(m.budget) != 2 || !m.budget[0] || m.budget[1] {
+		t.Fatalf("err %v budgets %v, want the pending step with a budget and the new delivery without", err, m.budget)
 	}
 }
